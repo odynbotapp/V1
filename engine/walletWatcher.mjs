@@ -1220,11 +1220,21 @@ export class SolanaWalletWatcher {
     }
   }
 
+  /** Return fastRpcUrls that are not currently in a 429 rate-limit cooldown window. */
+  activeFastRpcUrls(excludeUrl = this.rpcUrl) {
+    const now = Date.now();
+    return (this.fastRpcUrls || []).filter((u) => {
+      if (!u || u === excludeUrl) return false;
+      const until = this.rateLimitedUntil?.get(u) || 0;
+      return now >= until;
+    });
+  }
+
   /** RPC call; a 429 (rate limited) is retried a few times with growing pauses. Fast calls race fastRpcUrls. */
   async rpc(method, params, { fast = false, rpcUrl = this.rpcUrl } = {}) {
-    const altUrls = rpcUrl === this.rpcUrl ? (this.fastRpcUrls || []).filter((u) => u && u !== this.rpcUrl) : [];
+    const altUrls = rpcUrl === this.rpcUrl ? this.activeFastRpcUrls(this.rpcUrl) : [];
     for (let attempt = 0; ; attempt++) {
-      if (!fast) await this.throttle();
+      if (!fast || attempt > 0) await this.throttle();
       try {
         if (fast && altUrls.length && attempt === 0) {
           const urls = [rpcUrl, ...altUrls];
@@ -1277,7 +1287,7 @@ export class SolanaWalletWatcher {
    * indexing lag never delays a live stream trade.
    */
   async rpcRace(method, params, isGood = (r) => r != null) {
-    const extras = (this.fastRpcUrls || []).filter((u) => u && u !== this.rpcUrl);
+    const extras = this.activeFastRpcUrls(this.rpcUrl);
     if (!extras.length) return this.rpc(method, params, { fast: true });
     const urls = [this.rpcUrl, ...extras];
     try {
@@ -1319,11 +1329,21 @@ export class SolanaWalletWatcher {
       const ms = Date.now() - startedAt;
       this.status.rpcMs = this.status.rpcMs ? Math.round(this.status.rpcMs * 0.7 + ms * 0.3) : ms;
     }
-    if (res.status === 429) throw new RpcError('RPC rate limit (429) — slowing down', { rateLimited: true });
+    if (res.status === 429) {
+      if (rpcUrl !== this.rpcUrl) {
+        if (!this.rateLimitedUntil) this.rateLimitedUntil = new Map();
+        this.rateLimitedUntil.set(rpcUrl, Date.now() + 60_000);
+      }
+      throw new RpcError('RPC rate limit (429) — slowing down', { rateLimited: true });
+    }
     if (!res.ok) throw new RpcError(`RPC HTTP ${res.status}`);
     const json = await res.json();
     if (json.error) {
       const rate = json.error.code === 429 || /rate|too many/i.test(json.error.message || '');
+      if (rate && rpcUrl !== this.rpcUrl) {
+        if (!this.rateLimitedUntil) this.rateLimitedUntil = new Map();
+        this.rateLimitedUntil.set(rpcUrl, Date.now() + 60_000);
+      }
       throw new RpcError(`RPC error: ${json.error.message || json.error.code}`, { rateLimited: rate });
     }
     return json.result;
@@ -1965,8 +1985,7 @@ export class SolanaWalletWatcher {
     // The live feed watches this wallet: each move was already read from its own block, so the
     // slow full scan is only a backup for a move the feed did not report.
     if (moved && !prev.misses && this.balanceFeedLive(w)) {
-      const newestCovered = !newest || Boolean(head[0]?.err) || this.seenSigs.has(newest) || this.spamSigs.has(newest);
-      const seenByFeed = (w.lastMoveAt || 0) >= (prev.at || 0) && newestCovered;
+      const seenByFeed = (w.lastMoveAt || 0) >= (prev.at || 0);
       if (seenByFeed || !prev.waitedAt) {
         w.flood = seenByFeed
           ? { sol: bal.sol, usdc: bal.usdc ?? prev.usdc, seenSol: bal.sol, seenUsdc: bal.usdc, lastSig: newest || prev.lastSig, misses: 0, at: Date.now() }
@@ -1997,16 +2016,17 @@ export class SolanaWalletWatcher {
 
   /** Read every signature newer than `untilSig`, keep successful transactions signed by the wallet. */
   async scanOwnTransactions(w, untilSig, fast = null) {
-    const MAX_PAGES = 20; // 20k signatures ≈ a minute of a 300 tx/s spam flood
+    const liveFeedConnected = Boolean(this.stream?.stats?.connected || this.tokenStream?.stats?.connected);
+    const MAX_PAGES = liveFeedConnected ? 2 : 20;
     const ok = [];
     let before;
     let pages = 0;
     let capped = false;
     for (;;) {
-      const page = (await this.rpc('getSignaturesForAddress', [w.address, { limit: 1000, commitment: 'confirmed', ...(untilSig ? { until: untilSig } : {}), ...(before ? { before } : {}) }])) || [];
+      const page = (await this.rpc('getSignaturesForAddress', [w.address, { limit: liveFeedConnected ? 150 : 1000, commitment: 'confirmed', ...(untilSig ? { until: untilSig } : {}), ...(before ? { before } : {}) }])) || [];
       pages += 1;
       for (const x of page) if (!x.err && !this.seenSigs.has(x.signature) && !this.spamSigs.has(x.signature)) ok.push(x.signature);
-      if (page.length < 1000 || !untilSig) break;
+      if (page.length < (liveFeedConnected ? 150 : 1000) || !untilSig) break;
       if (pages >= MAX_PAGES) {
         capped = true;
         break;
@@ -2016,7 +2036,8 @@ export class SolanaWalletWatcher {
     if (capped) this.noteSkip(w, `scan-${Date.now()}`, 'too much spam between checks to read every transaction (oldest skipped)');
     this.status.floodScanned = (this.status.floodScanned || 0) + ok.length;
     // open successful ones (oldest first), a few at a time; only the wallet's own count
-    const todo = ok.reverse().slice(-300);
+    const maxOpen = liveFeedConnected ? 30 : 300;
+    const todo = ok.reverse().slice(-maxOpen);
     const out = [];
     for (let i = 0; i < todo.length; i += 4) {
       const batch = todo.slice(i, i + 4);
