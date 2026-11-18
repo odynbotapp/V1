@@ -35,6 +35,12 @@ for (const k of ['SODAE_RPC_URL', 'SODAE_GRPC_URL']) {
     process.env[k] = process.env[k].replace(/nt3gU6U-uxGLEUv-U6AUsp|nYJ5OFH-miFDcf1-SLKrCs/g, 'tb2P8qB-Uro4s4u-duo8Uc');
   }
 }
+if (!process.env.SODAE_GRPC_URL && process.env.SODAE_RPC_URL && /sodae\.io/i.test(process.env.SODAE_RPC_URL)) {
+  process.env.SODAE_GRPC_URL = process.env.SODAE_RPC_URL.replace(/:8899\b/, ':10201');
+}
+if (process.env.SODAE_GRPC_URL && /sodae\.io:8899\b/i.test(process.env.SODAE_GRPC_URL)) {
+  process.env.SODAE_GRPC_URL = process.env.SODAE_GRPC_URL.replace(/:8899\b/, ':10201');
+}
 const PORT = Number(process.env.PORT || 3400);
 // Hosting platforms (Railway) must reach the server from outside the container
 const ON_RAILWAY = Boolean(
