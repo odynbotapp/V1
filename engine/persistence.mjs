@@ -81,11 +81,28 @@ export function restoreEngine(engine, data) {
         f.decuV6Migrated = true;
         f.decuV7Migrated = true;
       }
-      if ((f.id === 'fol-03782071' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9') && !f.decuV8Migrated) {
+      if ((f.id === 'fol-03782071' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9') && !f.decuV10Migrated) {
+        f.mode = 'auto-exit';
+        f.mirrorSells = true;
+        f.slPct = null;
+        f.tpPct = null;
         f.copyTopUps = true;
         f.reentryCooldownMin = 0;
-        f.filtersOverride = { ...(f.filtersOverride || {}), minTraderBuyNative: 1 };
+        f.maxChasePct = 30;
+        f.matureMaxChasePct = 26.5;
+        f.freshMcMaxUsd = 12000;
+        const curRules = f.exitRules || followTraderExitRules();
+        f.exitRules = {
+          ...curRules,
+          takeInitials: { ...(curRules.takeInitials || {}), enabled: true, takeAtPct: 35, sellSizePct: 100 },
+          moonbagTrail: { ...(curRules.moonbagTrail || {}), enabled: true, trailPct: 10, armsAtPct: 22 },
+          floor: { ...(curRules.floor || {}), enabled: true, openingFloorPct: 25, tightensAfterSec: 18, tightFloorPct: 14, graceSec: 4 },
+          waveCut: { ...(curRules.waveCut || {}), enabled: true, afterSec: 25, needsPeakPct: 4 },
+          hardTimeCap: { ...(curRules.hardTimeCap || {}), enabled: true, timeCapSec: 180 },
+        };
+        f.filtersOverride = { ...(f.filtersOverride || {}), minTraderBuyNative: 1, maxMarketCapUsd: 100000 };
         f.decuV8Migrated = true;
+        f.decuV10Migrated = true;
       }
     }
   }

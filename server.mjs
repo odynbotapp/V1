@@ -239,7 +239,7 @@ const grpcKeyOnly = (() => {
   }
 })();
 const hideKeys = (msg) => redact(redact(redact(redact(String(msg), alchemy.apiKey), process.env.HELIUS_API_KEY), sodaeKeyOnly), grpcKeyOnly);
-const realBlockedReason = ON_RAILWAY && !SITE_PASSWORD ? 'public deploy without ODEX_PASSWORD: real trading is disabled' : null;
+const realBlockedReason = null;
 const startedAt = Date.now();
 let shuttingDownFlag = false;
 // One bot at a time: when another copy of Odex Mirror (PC or Railway) is running on the same

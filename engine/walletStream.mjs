@@ -206,10 +206,17 @@ export class WalletStream {
       this.changed();
       return;
     }
+    const usePublicFallback =
+      this.WS === globalThis.WebSocket &&
+      (this.consecutiveErrors || 0) >= 2 &&
+      this.url !== 'wss://api.mainnet-beta.solana.com';
+    const targetUrl = usePublicFallback ? 'wss://api.mainnet-beta.solana.com' : this.url;
+    this.activeUrl = targetUrl;
     let ws;
     try {
-      ws = new this.WS(this.url);
+      ws = new this.WS(targetUrl);
     } catch (err) {
+      this.consecutiveErrors = (this.consecutiveErrors || 0) + 1;
       this.fail(err.message);
       this.scheduleReconnect();
       return;
@@ -217,6 +224,7 @@ export class WalletStream {
     this.ws = ws;
     ws.onopen = () => {
       clearTimeout(this.timers.connect);
+      this.consecutiveErrors = usePublicFallback ? 2 : 0;
       this.stats.connected = true;
       this.stats.connectedAt = Date.now();
       this.stats.downSince = null;
@@ -231,6 +239,7 @@ export class WalletStream {
     const dropped = () => {
       if (this.ws !== ws) return;
       clearTimeout(this.timers.connect);
+      this.consecutiveErrors = usePublicFallback ? 0 : (this.consecutiveErrors || 0) + 1;
       this.teardown();
       this.stats.downSince = this.stats.downSince || Date.now();
       this.changed();

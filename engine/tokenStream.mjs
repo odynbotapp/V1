@@ -102,6 +102,7 @@ export class TokenAccountStream {
 
   stop() {
     this.running = false;
+    clearTimeout(this.timers.connect);
     clearTimeout(this.timers.reconnect);
     clearInterval(this.timers.keepalive);
     try {
@@ -156,15 +157,48 @@ export class TokenAccountStream {
 
   connect() {
     if (!this.running || !this.supported) return;
+    const usePublicFallback =
+      this.WS === globalThis.WebSocket &&
+      (this.consecutiveErrors || 0) >= 2 &&
+      this.url !== 'wss://api.mainnet-beta.solana.com';
+    const targetUrl = usePublicFallback ? 'wss://api.mainnet-beta.solana.com' : this.url;
+    this.activeUrl = targetUrl;
     let ws;
     try {
-      ws = new this.WS(this.url);
+      ws = new this.WS(targetUrl);
     } catch (err) {
+      this.consecutiveErrors = (this.consecutiveErrors || 0) + 1;
       this.fail(err.message);
       return this.scheduleReconnect();
     }
     this.ws = ws;
+    const dropped = () => {
+      if (this.ws !== ws) return;
+      clearTimeout(this.timers.connect);
+      this.consecutiveErrors = usePublicFallback ? 0 : (this.consecutiveErrors || 0) + 1;
+      this.ws = null;
+      this.stats.connected = false;
+      clearInterval(this.timers.keepalive);
+      try {
+        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+        ws.close();
+      } catch {
+        // ignore
+      }
+      this.emitStatus();
+      this.scheduleReconnect();
+    };
+    clearTimeout(this.timers.connect);
+    this.timers.connect = setTimeout(() => {
+      if (this.ws === ws && ws.readyState !== 1) {
+        this.fail('token stream connection timed out');
+        dropped();
+      }
+    }, 10_000);
+    this.timers.connect.unref?.();
     ws.onopen = () => {
+      clearTimeout(this.timers.connect);
+      this.consecutiveErrors = usePublicFallback ? 2 : 0;
       this.stats.connected = true;
       this.stats.connectedAt = Date.now();
       this.backoffMs = 1000;
@@ -177,15 +211,11 @@ export class TokenAccountStream {
       this.emitStatus();
     };
     ws.onmessage = (evt) => this.handleMessage(evt.data);
-    ws.onerror = () => this.fail('token stream connection error');
-    ws.onclose = () => {
-      if (this.ws !== ws) return;
-      this.ws = null;
-      this.stats.connected = false;
-      clearInterval(this.timers.keepalive);
-      this.emitStatus();
-      this.scheduleReconnect();
+    ws.onerror = () => {
+      this.fail('token stream connection error');
+      if (ws.readyState !== 1) dropped();
     };
+    ws.onclose = () => dropped();
   }
 
   scheduleReconnect() {
