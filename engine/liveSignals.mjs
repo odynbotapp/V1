@@ -60,7 +60,8 @@ export class LiveSignalService {
     // Sodae's WebSocket is not at the validator-convention address (checked: port 8900 does not
     // answer, 8899 refuses WebSockets), so it is only used when SODAE_WS_URL is set explicitly
     const sodaeWs = String(env.SODAE_WS_URL || '').trim() || null;
-    const grpcUrl = String(env.SODAE_GRPC_URL || env.YELLOWSTONE_GRPC_URL || '').trim() || null;
+    const rawGrpcUrl = String(env.SODAE_GRPC_URL || env.YELLOWSTONE_GRPC_URL || '').trim() || null;
+    const grpcUrl = rawGrpcUrl && /sodae\.io:8899\b/i.test(rawGrpcUrl) ? rawGrpcUrl.replace(/:8899\b/, ':10201') : rawGrpcUrl;
     const grpcKey = grpcUrl ? (() => { try { return new URL(grpcUrl).searchParams.get('api-key'); } catch { return null; } })() : null;
     this.watcher =
       watcher ||

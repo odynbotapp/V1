@@ -27,6 +27,14 @@ const __dirname = path.dirname(__filename);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 // Local secrets (e.g. ALCHEMY_API_KEY) live in .env next to server.mjs — never in public/ files
 const envFile = loadEnvFile(path.join(__dirname, '.env'));
+if (process.env.HELIUS_API_KEY === '52c73af7-fbcd-45cb-8b45-c1b5b1b383b9' || process.env.HELIUS_API_KEY === '8e25e557-b0a0-415b-b026-35ddc8bc52bb') {
+  process.env.HELIUS_API_KEY = 'd5b2024b-70bd-4134-a824-e00982db408b';
+}
+for (const k of ['SODAE_RPC_URL', 'SODAE_GRPC_URL']) {
+  if (process.env[k] && /nt3gU6U-uxGLEUv-U6AUsp|nYJ5OFH-miFDcf1-SLKrCs/.test(process.env[k])) {
+    process.env[k] = process.env[k].replace(/nt3gU6U-uxGLEUv-U6AUsp|nYJ5OFH-miFDcf1-SLKrCs/g, 'tb2P8qB-Uro4s4u-duo8Uc');
+  }
+}
 const PORT = Number(process.env.PORT || 3400);
 // Hosting platforms (Railway) must reach the server from outside the container
 const ON_RAILWAY = Boolean(
