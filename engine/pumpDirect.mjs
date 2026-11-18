@@ -61,6 +61,54 @@ export const JITO_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
 ];
 
+// Official SWQoS / MEV landing provider tip accounts for multi-relay race fan-out
+export const NOZOMI_TIP_ACCOUNTS = [
+  'TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq',
+  'noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4',
+  'noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE',
+  'noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo',
+  'noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ',
+  'nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L',
+  'nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne',
+];
+
+export const ASTRALANE_TIP_ACCOUNTS = [
+  'astrazznxsGUhWShqgNtAdfrzP2G83DzcWVJDxwV9bF',
+  'astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm',
+];
+
+export const NEXTBLOCK_TIP_ACCOUNTS = [
+  'NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE',
+  'NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2',
+];
+
+export const BLOCKRAZOR_TIP_ACCOUNTS = [
+  'FjmZZrFvhnqqb9ThCuMVnENaM3JGVuG7yCAxRJcFpg9',
+  '6No2i3aawzHsjtThw81iq1EXPJN6rh8eSJCLaYZfKDTG',
+];
+
+export const RELAY_TIP_ACCOUNTS = {
+  jito: JITO_TIP_ACCOUNTS,
+  nozomi: NOZOMI_TIP_ACCOUNTS,
+  astralane: ASTRALANE_TIP_ACCOUNTS,
+  nextblock: NEXTBLOCK_TIP_ACCOUNTS,
+  blockrazor: BLOCKRAZOR_TIP_ACCOUNTS,
+};
+
+/** Classify a broadcast URL into its landing relay kind ('jito' | 'nozomi' | 'astralane' | 'nextblock' | 'blockrazor' | 'swqos'). */
+export function detectRelayKind(url) {
+  const s = String(url || '');
+  if (/jito\.wtf/i.test(s)) return 'jito';
+  if (/nozomi|temporal\.xyz/i.test(s)) return 'nozomi';
+  if (/astralane/i.test(s)) return 'astralane';
+  if (/nextblock/i.test(s)) return 'nextblock';
+  if (/blockrazor/i.test(s)) return 'blockrazor';
+  return 'swqos';
+}
+
+// Official Jito anti-sandwich marker account: prevents any Jito bundle from front-running our swap (0 CU cost)
+export const JITO_DONT_FRONT_ACCOUNT = 'jitodontfront111111111111111111111111111111';
+
 // Tight compute unit budgets (~85k-95k CU actual on buy with ATA creation; ~50k-65k CU on sell)
 export const DIRECT_BUY_UNITS = 115_000;
 export const DIRECT_SELL_UNITS = 90_000;
@@ -139,10 +187,14 @@ const u32le = (v) => {
 };
 const meta = (pubkey, isSigner, isWritable) => ({ pubkey, isSigner, isWritable });
 
-export function computeBudgetIxs({ units = DIRECT_BUY_UNITS, microLamports = 100_000 } = {}) {
+export function computeBudgetIxs({ units = DIRECT_BUY_UNITS, microLamports = 100_000, dontFront = true } = {}) {
   return [
     { programId: COMPUTE_BUDGET_PROGRAM, keys: [], data: Buffer.concat([Buffer.from([2]), u32le(units)]) },
-    { programId: COMPUTE_BUDGET_PROGRAM, keys: [], data: Buffer.concat([Buffer.from([3]), u64le(microLamports)]) },
+    {
+      programId: COMPUTE_BUDGET_PROGRAM,
+      keys: dontFront ? [meta(JITO_DONT_FRONT_ACCOUNT, false, false)] : [],
+      data: Buffer.concat([Buffer.from([3]), u64le(microLamports)]),
+    },
   ];
 }
 
@@ -240,6 +292,19 @@ export function createAtaIdempotentIx({ payer, owner, mint, tokenProgram }) {
     programId: ATA_PROGRAM,
     keys: [meta(payer, true, true), meta(ataAddress(owner, mint, tokenProgram), false, true), meta(owner, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(tokenProgram, false, false)],
     data: Buffer.from([1]),
+  };
+}
+
+/**
+ * Non-idempotent CreateAssociatedTokenAccount (instruction 0): fails immediately at ~2,500 CU if
+ * another race variant already created the ATA in the same slot, acting as a free on-chain guard
+ * that prevents double-buys and saves MEV tips on losing copies.
+ */
+export function createAtaIx({ payer, owner, mint, tokenProgram }) {
+  return {
+    programId: ATA_PROGRAM,
+    keys: [meta(payer, true, true), meta(ataAddress(owner, mint, tokenProgram), false, true), meta(owner, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(tokenProgram, false, false)],
+    data: Buffer.from([0]),
   };
 }
 

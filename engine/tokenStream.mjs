@@ -68,9 +68,24 @@ export class TokenAccountStream {
 
   setWallets(addresses) {
     const next = new Set(addresses);
-    const same = next.size === this.wallets.size && [...next].every((a) => this.wallets.has(a));
+    const prev = this.wallets;
+    const same = next.size === prev.size && [...next].every((a) => prev.has(a));
     this.wallets = next;
-    if (!same && this.running) this.reconnectNow();
+    if (same || !this.running) return;
+    if (this.ws && this.ws.readyState === 1 && this.stats.connected) {
+      for (const w of next) {
+        if (!prev.has(w)) this.subscribeWallet(w);
+      }
+      for (const [subId, meta] of [...this.subs.entries()]) {
+        if (!next.has(meta.wallet)) {
+          this.send({ method: 'programUnsubscribe', params: [subId] });
+          this.subs.delete(subId);
+        }
+      }
+      this.emitStatus();
+      return;
+    }
+    this.reconnectNow();
   }
 
   setUrl(url) {
@@ -123,15 +138,19 @@ export class TokenAccountStream {
     return id;
   }
 
+  subscribeWallet(wallet) {
+    for (const program of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
+      const filters = [{ memcmp: { offset: 32, bytes: wallet } }];
+      if (program === TOKEN_PROGRAM) filters.push({ dataSize: 165 });
+      this.send({ method: 'programSubscribe', params: [program, { encoding: 'base64', commitment: this.commitment, filters }] }, { wallet, program });
+    }
+  }
+
   subscribeAll() {
     this.subs.clear();
     this.pending.clear();
     for (const wallet of this.wallets) {
-      for (const program of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
-        const filters = [{ memcmp: { offset: 32, bytes: wallet } }];
-        if (program === TOKEN_PROGRAM) filters.push({ dataSize: 165 });
-        this.send({ method: 'programSubscribe', params: [program, { encoding: 'base64', commitment: this.commitment, filters }] }, { wallet, program });
-      }
+      this.subscribeWallet(wallet);
     }
   }
 
@@ -188,7 +207,10 @@ export class TokenAccountStream {
       const meta = this.pending.get(msg.id);
       this.pending.delete(msg.id);
       if (msg.error) this.fail(`subscribe failed: ${msg.error.message || 'error'}`);
-      else if (typeof msg.result === 'number') this.subs.set(msg.result, meta);
+      else if (typeof msg.result === 'number') {
+        if (this.wallets.has(meta.wallet)) this.subs.set(msg.result, meta);
+        else this.send({ method: 'programUnsubscribe', params: [msg.result] });
+      }
       this.emitStatus();
       return;
     }

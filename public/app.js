@@ -2514,7 +2514,7 @@ function populateSettingsInputs() {
   const routeEl = document.getElementById('set-swap-route');
   if (routeEl) routeEl.value = s.swapRoute === 'direct' ? 'direct' : 'jupiter';
   const fastEl = document.getElementById('set-fast-detect');
-  if (fastEl) fastEl.value = s.fastDetect === true ? 'true' : 'false';
+  if (fastEl) fastEl.value = s.fastDetect !== false ? 'true' : 'false';
   const topUpsEl = document.getElementById('set-copy-topups');
   if (topUpsEl) topUpsEl.value = s.copyTopUps ? 'true' : 'false';
   const scs = { autoPause: true, minTrades: 10, maxSlipPct: 20, maxLagSec: 10, ...(s.scorecard || {}) };

@@ -195,6 +195,7 @@ export class CopyTradingEngine {
     this.settings = {
       selectedChain: 'solana',
       paperTrading: true,
+      fastDetect: true,
       // Profile, security and notification preferences (Settings page)
       ui: createDefaultUiSettings(),
       buySlippagePct: {
@@ -455,17 +456,13 @@ export class CopyTradingEngine {
           f.traderWallet.toLowerCase() === String(signal.traderWallet || '').toLowerCase())
     );
 
-    const results = [];
-    for (const follow of matchingFollows) {
-      if (signal.side === 'sell') {
-        const res = await this.handleLeaderSellSignal(follow, signal);
-        results.push(res);
-      } else {
-        const res = await this.handleLeaderBuySignal(follow, signal);
-        results.push(res);
-      }
-    }
-    return results;
+    return Promise.all(
+      matchingFollows.map((follow) =>
+        signal.side === 'sell'
+          ? this.handleLeaderSellSignal(follow, signal)
+          : this.handleLeaderBuySignal(follow, signal)
+      )
+    );
   }
 
   /**
@@ -478,19 +475,33 @@ export class CopyTradingEngine {
     // the trader's next buy of the same coin can arrive meanwhile: without this lock both were
     // copied, because the "already copied" mark is only set once the first buy has filled.
     if (!this.buysInFlight) this.buysInFlight = new Set();
+    if (!this.inFlightBuyPromises) this.inFlightBuyPromises = new Map();
+    if (!this.inFlightBuySigs) this.inFlightBuySigs = new Map();
     const key = `${follow.id}:${signal.token.address}`;
     if (this.buysInFlight.has(key)) {
-      return this.recordSkip({
-        follow,
-        wallet: this.getWalletById(follow.walletId),
-        signal,
-        reason: this.copyTopUpsFor(follow) ? 'a copy of this coin is already being bought' : 'trader is adding to a coin already copied (top-ups not copied)',
-      });
+      const inFlightSig = this.inFlightBuySigs.get(key);
+      if (this.copyTopUpsFor(follow) && signal.signature && inFlightSig && signal.signature !== inFlightSig) {
+        while (this.buysInFlight.has(key)) {
+          const prevP = this.inFlightBuyPromises.get(key);
+          if (!prevP) break;
+          await prevP.catch(() => null);
+        }
+      } else {
+        return this.recordSkip({
+          follow,
+          wallet: this.getWalletById(follow.walletId),
+          signal,
+          reason: this.copyTopUpsFor(follow) ? 'a copy of this coin is already being bought' : 'trader is adding to a coin already copied (top-ups not copied)',
+        });
+      }
     }
     this.buysInFlight.add(key);
+    this.inFlightBuySigs.set(key, signal.signature || null);
     const spend = { entry: null }; // this buy's reservation against the trader's daily SOL limit
+    const runP = this.handleLeaderBuySignalNow(follow, signal, { ...opts, spend });
+    this.inFlightBuyPromises.set(key, runP);
     try {
-      const r = await this.handleLeaderBuySignalNow(follow, signal, { ...opts, spend });
+      const r = await runP;
       if (spend.entry) {
         if (r?.status === 'filled' && r.position) {
           // replace the reserved amount with what the buy really cost
@@ -507,6 +518,8 @@ export class CopyTradingEngine {
       throw err;
     } finally {
       this.buysInFlight.delete(key);
+      this.inFlightBuyPromises.delete(key);
+      this.inFlightBuySigs.delete(key);
     }
   }
 
@@ -623,6 +636,22 @@ export class CopyTradingEngine {
     }
 
     const traderBuyUsd = Number(signal.traderBuyUsd ?? 100);
+    if (traderBuyUsd < follow.minTradeUsd) {
+      return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'below your minimum' });
+    }
+
+    const effFilters = this.getEffectiveFilters(follow);
+    const traderBuyNative =
+      signal.traderBuyNative !== undefined ? signal.traderBuyNative : traderBuyUsd / chain.nativePriceUsd;
+    if (traderBuyNative !== null && traderBuyNative !== undefined) {
+      if (effFilters.minTraderBuyNative !== null && traderBuyNative < effFilters.minTraderBuyNative) {
+        return this.recordSkip({ dryRun, follow, wallet, signal, reason: "trader's buy size outside your filter" });
+      }
+      if (effFilters.maxTraderBuyNative !== null && traderBuyNative > effFilters.maxTraderBuyNative) {
+        return this.recordSkip({ dryRun, follow, wallet, signal, reason: "trader's buy size outside your filter" });
+      }
+    }
+
     // Top-up of a coin we never bought: the trader's first buy was missed (skipped, too late or not
     // seen), so this later buy would be a late entry — after the copier wave, usually a loss. This
     // applies even with "copy top-ups" on: top-ups only make sense on top of our first copy.
@@ -657,12 +686,6 @@ export class CopyTradingEngine {
       }
     }
 
-    if (traderBuyUsd < follow.minTradeUsd) {
-      return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'below your minimum' });
-    }
-
-    const effFilters = this.getEffectiveFilters(follow);
-
     if (effFilters.pumpOnly) {
       if (follow.chainId === 'arc') {
         return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'launchpad-only setting is on' });
@@ -685,17 +708,6 @@ export class CopyTradingEngine {
       }
       if (effFilters.maxMarketCapUsd !== null && token.marketCapUsd >= effFilters.maxMarketCapUsd) {
         return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'market cap outside your filter' });
-      }
-    }
-
-    const traderBuyNative =
-      signal.traderBuyNative !== undefined ? signal.traderBuyNative : traderBuyUsd / chain.nativePriceUsd;
-    if (traderBuyNative !== null && traderBuyNative !== undefined) {
-      if (effFilters.minTraderBuyNative !== null && traderBuyNative < effFilters.minTraderBuyNative) {
-        return this.recordSkip({ dryRun, follow, wallet, signal, reason: "trader's buy size outside your filter" });
-      }
-      if (effFilters.maxTraderBuyNative !== null && traderBuyNative > effFilters.maxTraderBuyNative) {
-        return this.recordSkip({ dryRun, follow, wallet, signal, reason: "trader's buy size outside your filter" });
       }
     }
 
@@ -726,10 +738,11 @@ export class CopyTradingEngine {
       return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'snipe tax' });
     }
 
-    if (this.settings.cooldown.enabled) {
+    const wantPaperMode = Boolean(this.settings.paperTrading);
+    if (this.settings.cooldown.enabled && follow.copyTopUps !== true) {
       const cooldownKey = `${follow.chainId}:${token.address}`;
       const holdingPos = this.positions.find(
-        (p) => p.chainId === follow.chainId && p.tokenAddress === token.address && p.remainingTokens > 0
+        (p) => p.chainId === follow.chainId && p.tokenAddress === token.address && p.remainingTokens > 0 && Boolean(p.isPaper) === wantPaperMode
       );
       if (this.settings.cooldown.mode === 'while_holding' && holdingPos) {
         return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'buy cooldown is active' });
@@ -741,7 +754,7 @@ export class CopyTradingEngine {
     }
 
     const followOpenPositions = this.positions.filter(
-      (p) => p.followId === follow.id && p.chainId === follow.chainId && p.remainingTokens > 0
+      (p) => p.followId === follow.id && p.chainId === follow.chainId && p.remainingTokens > 0 && Boolean(p.isPaper) === wantPaperMode
     );
     if (followOpenPositions.length >= follow.maxOpenPositions) {
       return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'position limit reached' });
@@ -771,7 +784,7 @@ export class CopyTradingEngine {
 
     if (follow.chainId === 'solana' && this.settings.risk.exposureLimitUsd !== null) {
       const totalSolanaExposure = this.positions
-        .filter((p) => p.chainId === 'solana' && p.remainingTokens > 0)
+        .filter((p) => p.chainId === 'solana' && p.remainingTokens > 0 && Boolean(p.isPaper) === wantPaperMode)
         .reduce((sum, p) => sum + p.remainingCostUsd, 0);
       if (totalSolanaExposure + desiredUsd > this.settings.risk.exposureLimitUsd) {
         return this.recordSkip({ dryRun, follow, wallet, signal, reason: 'total exposure limit reached' });
@@ -1188,18 +1201,32 @@ export class CopyTradingEngine {
       });
     }
 
-    // prefer a position of the current mode (real vs paper) when both hold this token
+    // prefer positions of the current mode (real vs paper) when both hold this token
     const wantPaper = Boolean(this.settings.paperTrading);
-    const pos = [...this.positions].sort((a, b) => (Boolean(a.isPaper) === wantPaper ? 0 : 1) - (Boolean(b.isPaper) === wantPaper ? 0 : 1)).find(
-      (p) =>
-        p.followId === follow.id &&
-        p.chainId === signal.chainId &&
-        // match by token address; symbols are not unique (many tokens share a ticker)
-        (signal.token.address ? p.tokenAddress === signal.token.address : p.symbol.toLowerCase() === String(signal.token.symbol || '').toLowerCase()) &&
-        p.remainingTokens > 0
-    );
+    const findMatchingPositions = () => {
+      const all = this.positions.filter(
+        (p) =>
+          p.followId === follow.id &&
+          p.chainId === signal.chainId &&
+          // match by token address; symbols are not unique (many tokens share a ticker)
+          (signal.token.address ? p.tokenAddress === signal.token.address : p.symbol.toLowerCase() === String(signal.token.symbol || '').toLowerCase()) &&
+          p.remainingTokens > 0
+      );
+      const sameMode = all.filter((p) => Boolean(p.isPaper) === wantPaper);
+      return sameMode.length ? sameMode : all;
+    };
+    let matching = findMatchingPositions();
+    if (!matching.length && !dryRun && signal.token?.address) {
+      const inFlightKey = `${follow.id}:${signal.token.address}`;
+      const buyP = this.inFlightBuyPromises?.get(inFlightKey);
+      if (buyP) {
+        await buyP.catch(() => null);
+        if (Number(signal.sellSharePct ?? 100) >= 99) this.endCopiedCycle(follow.id, signal.token.address);
+        matching = findMatchingPositions();
+      }
+    }
 
-    if (!pos) {
+    if (!matching.length) {
       return this.recordSkip({
         dryRun,
         follow,
@@ -1214,13 +1241,20 @@ export class CopyTradingEngine {
     // their bag is their exit, so we sell everything (smaller trims are mirrored as they are)
     if (follow.mode === 'auto-exit' && sellPct >= 50) sellPct = 100;
     if (dryRun) return { status: 'would_copy', dryRun: true, sellPct };
-    return this.executePositionSell(pos.id, {
+    const sellOpts = {
       sellPct,
       cause: follow.mode === 'auto-exit' ? 'trader sold' : 'Mirror sell',
       traderExitPriceUsd: Number(signal.token?.traderFillPriceUsd) || null,
       traderSellSol: Number(signal.traderPoolSol > 0 ? signal.traderPoolSol : signal.traderBuyNative) || null,
       traderSellCurve: signal.token?.curve || null,
-    });
+    };
+    let lastRes = null;
+    for (let i = 0; i < matching.length; i++) {
+      const pos = matching[i];
+      if (i > 0) pos.lastCurve = null;
+      lastRes = await this.executePositionSell(pos.id, i === 0 ? sellOpts : { ...sellOpts, traderSellCurve: null });
+    }
+    return lastRes;
   }
 
   /**
@@ -1342,7 +1376,7 @@ export class CopyTradingEngine {
       });
       if (sc?.fillPriceUsd > 0) paperSellFillPriceUsd = sc.fillPriceUsd;
     }
-    const freshPosCurve = pos.lastCurve && (!pos.lastCurve.at || Date.now() - Number(pos.lastCurve.at) < 2000) ? pos.lastCurve : null;
+    const freshPosCurve = pos.lastCurve && (!pos.lastCurve.at || Date.now() - Number(pos.lastCurve.at) < 4500) ? pos.lastCurve : null;
     const sellCurve = (traderSellCurve ? pos.lastCurve : null) || freshPosCurve;
     let quote;
     try {
@@ -1966,7 +2000,7 @@ export class CopyTradingEngine {
     }
     const live = customMultiplierByPosId ? new Map() : await this.fetchLivePrices(realMints.filter((m) => !curves.has(m)));
 
-    const exits = [];
+    const exitGroups = new Map();
     for (const pos of openPositions) {
       const quote = live.get(pos.tokenAddress);
       const curve = curves.get(pos.tokenAddress);
@@ -2006,10 +2040,17 @@ export class CopyTradingEngine {
         pos.peakMarketCapUsd = pos.currentMarketCapUsd;
       }
 
-      exits.push(this.evaluatePositionExits(pos, now));
+      const gKey = !pos.isPaper && pos.tokenAddress ? `${pos.chainId}:${pos.tokenAddress}` : pos.id;
+      if (!exitGroups.has(gKey)) exitGroups.set(gKey, []);
+      exitGroups.get(gKey).push(pos);
     }
-    // Exits run side by side: one slow real sell (up to a minute) used to hold back every other
-    // position's stop-loss in the same tick. Each position still sells one at a time.
+    // Exits run side by side across distinct tokens, while multiple positions of the same real token
+    // evaluate sequentially so wallet balances and curves never race.
+    const exits = [...exitGroups.values()].map(async (group) => {
+      for (const pos of group) {
+        await this.evaluatePositionExits(pos, now);
+      }
+    });
     const settled = await Promise.allSettled(exits);
     this.emit('market_tick', { timestamp: now });
     const failed = settled.find((r) => r.status === 'rejected');
@@ -2395,17 +2436,41 @@ export class CopyTradingEngine {
     if (!mint) return false;
     const haveCopy = this.positions.some((p) => p.followId === follow.id && p.tokenAddress === mint && p.remainingTokens > 0);
     if (haveCopy) return false;
+    // If we already copied an entry in this trader cycle (e.g. our first copy hit TP while the trader
+    // is still buying more), this is a top-up of a copied cycle, not a missed first entry.
+    if (this.copiedCycleActive(follow.id, mint) && !this.copiedCycleActive(follow.id, mint, 'missed')) return false;
+    const effFilters = this.getEffectiveFilters(follow);
+    const minBuyNative = Number(effFilters?.minTraderBuyNative) || 0;
+    const since = Date.now() - 2 * 3600_000;
+    const log = follow.traderWallet && Array.isArray(this.traderLog)
+      ? this.traderLog.filter((e) => e.w === follow.traderWallet && e.mint === mint && e.t >= since && e.sig !== signal.signature)
+      : [];
+    const lastExit = log.filter((e) => e.side === 'sell' && Number(e.share) >= 99).reduce((m, e) => Math.max(m, e.t), 0);
+    const cycleBuys = log.filter((e) => e.side === 'buy' && e.t > lastExit);
+    const allCycleBuysSkippedForSize =
+      cycleBuys.length > 0 &&
+      cycleBuys.every((e) => Array.isArray(e.copies) && e.copies.length > 0 && e.copies.every((c) => !c.ok && /buy size outside your filter|below your minimum/i.test(String(c.reason || ''))));
     const before = Number(signal.traderHeldBefore);
     if (signal.traderHeldBefore !== undefined && signal.traderHeldBefore !== null && Number.isFinite(before)) {
       const bought = Number(signal.traderTokens) || 0;
-      // leftovers of an earlier round (dust under 5% of this buy) don't count
-      return before > 0 && (!bought || before >= bought * 0.05);
+      if (before <= 0 || (bought > 0 && before < bought * 0.05)) return false;
+      if (allCycleBuysSkippedForSize) return false;
+      // When a trader has a minTraderBuyNative filter (e.g. 1+ SOL only, ignoring small <1 SOL MC-bump
+      // buys), a prior holding smaller than the min-buy threshold came from filtered-out small buys,
+      // so the first 1+ SOL buy is their real entry and must not be blocked.
+      if (minBuyNative > 0 && bought > 0 && before < bought) {
+        const chain = CHAINS[follow.chainId];
+        const traderBuyNative = signal.traderBuyNative !== undefined ? Number(signal.traderBuyNative) : Number(signal.traderBuyUsd || 0) / (Number(chain?.nativePriceUsd) || 1);
+        const estBeforeNative = traderBuyNative > 0 ? (before / bought) * traderBuyNative : 0;
+        if (estBeforeNative > 0 && estBeforeNative < minBuyNative) return false;
+      }
+      return true;
     }
-    if (!follow.traderWallet || !Array.isArray(this.traderLog)) return false;
-    const since = Date.now() - 2 * 3600_000;
-    const log = this.traderLog.filter((e) => e.w === follow.traderWallet && e.mint === mint && e.t >= since && e.sig !== signal.signature);
-    const lastExit = log.filter((e) => e.side === 'sell' && Number(e.share) >= 99).reduce((m, e) => Math.max(m, e.t), 0);
-    return log.some((e) => e.side === 'buy' && e.t > lastExit);
+    if (!log.length) return false;
+    return cycleBuys.some((e) => {
+      const skippedForSize = Array.isArray(e.copies) && e.copies.length > 0 && e.copies.every((c) => !c.ok && /buy size outside your filter|below your minimum/i.test(String(c.reason || '')));
+      return !skippedForSize;
+    });
   }
 
   copiedCycleActive(followId, mint, kind = '') {

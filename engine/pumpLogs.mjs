@@ -242,6 +242,7 @@ export function pumpTradeFromLogs(logs, trader, { err = null } = {}) {
   const trades = [];
   let complete = false;
   let seenTokenProgram = null;
+  let outerTokenProgram = null;
   for (const raw of logs) {
     const line = String(raw);
     if (/^Log truncated/i.test(line)) return { skip: 'logs truncated' };
@@ -249,8 +250,11 @@ export function pumpTradeFromLogs(logs, trader, { err = null } = {}) {
     if (m) {
       const depth = Number(m[2]);
       if (depth !== stack.length + 1) return { skip: 'invoke stack out of order' };
-      if (stack.includes(PUMP_PROGRAM) && (m[1] === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' || m[1] === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')) {
-        if (m[1] === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' || !seenTokenProgram) seenTokenProgram = m[1];
+      if (m[1] === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' || m[1] === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') {
+        if (m[1] === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' || !outerTokenProgram) outerTokenProgram = m[1];
+        if (stack.includes(PUMP_PROGRAM)) {
+          if (m[1] === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' || !seenTokenProgram) seenTokenProgram = m[1];
+        }
       }
       stack.push(m[1]);
       continue;
@@ -297,12 +301,26 @@ export function pumpTradeFromLogs(logs, trader, { err = null } = {}) {
   }
   if (stack.length) return { skip: 'logs incomplete' };
   if (!trades.length) return { skip: 'no pump.fun trade by this wallet' };
-  if (trades.length > 1) return { skip: 'several trades in one transaction' };
+  if (trades.length > 1) {
+    const first = trades[0];
+    const sameSplit = trades.every((x) => x.mint === first.mint && x.isBuy === first.isBuy && x.quoteMint === first.quoteMint);
+    if (!sameSplit) return { skip: 'several trades in one transaction' };
+    const last = trades[trades.length - 1];
+    trades[0] = {
+      ...last,
+      solAmount: trades.reduce((s, x) => s + (x.solAmount || 0n), 0n),
+      tokenAmount: trades.reduce((s, x) => s + (x.tokenAmount || 0n), 0n),
+      fee: trades.reduce((s, x) => s + (x.fee || 0n), 0n),
+      creatorFee: trades.reduce((s, x) => s + (x.creatorFee || 0n), 0n),
+      quoteAmount: trades.reduce((s, x) => s + (x.quoteAmount || 0n), 0n),
+    };
+  }
   if (complete) return { skip: 'curve completed in this transaction' };
   const t = trades[0];
   if (t.quoteMint !== WSOL_MINT) return { skip: 'coin not priced in SOL', nonSolBuy: Boolean(t.isBuy) };
   if (t.solAmount <= 0n || t.tokenAmount <= 0n) return { skip: 'empty trade' };
-  if (seenTokenProgram && !t.tokenProgram) t.tokenProgram = seenTokenProgram;
+  const resolvedTokenProgram = seenTokenProgram || outerTokenProgram;
+  if (resolvedTokenProgram && !t.tokenProgram) t.tokenProgram = resolvedTokenProgram;
   return { trade: t };
 }
 
@@ -423,7 +441,22 @@ export function pumpSwapTradeFromLogs(logs, trader, { err = null } = {}) {
   }
   if (stack.length) return { skip: 'logs incomplete' };
   if (!trades.length) return { skip: 'no pumpswap trade by this wallet' };
-  if (trades.length > 1) return { skip: 'several trades in one transaction' };
+  if (trades.length > 1) {
+    const first = trades[0];
+    const sameSplit = trades.every((x) => x.pool === first.pool && x.isBuy === first.isBuy);
+    if (!sameSplit) return { skip: 'several trades in one transaction' };
+    const last = trades[trades.length - 1];
+    trades[0] = {
+      ...last,
+      userBaseTokenReserves: first.userBaseTokenReserves,
+      userQuoteTokenReserves: first.userQuoteTokenReserves,
+      baseAmount: trades.reduce((s, x) => s + (x.baseAmount || 0n), 0n),
+      quoteAmount: trades.reduce((s, x) => s + (x.quoteAmount || 0n), 0n),
+      userQuoteAmount: trades.reduce((s, x) => s + (x.userQuoteAmount || 0n), 0n),
+      lpFee: trades.reduce((s, x) => s + (x.lpFee || 0n), 0n),
+      protocolFee: trades.reduce((s, x) => s + (x.protocolFee || 0n), 0n),
+    };
+  }
   if (complete) return { skip: 'curve completed in this transaction' };
   const t = trades[0];
   if (t.baseAmount <= 0n || t.quoteAmount <= 0n) return { skip: 'empty trade' };

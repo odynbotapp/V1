@@ -81,6 +81,12 @@ export function restoreEngine(engine, data) {
         f.decuV6Migrated = true;
         f.decuV7Migrated = true;
       }
+      if ((f.id === 'fol-03782071' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9') && !f.decuV8Migrated) {
+        f.copyTopUps = true;
+        f.reentryCooldownMin = 0;
+        f.filtersOverride = { ...(f.filtersOverride || {}), minTraderBuyNative: 1 };
+        f.decuV8Migrated = true;
+      }
     }
   }
   if (Array.isArray(data.positions)) engine.positions = data.positions;
@@ -151,8 +157,8 @@ export function serializeLive(live) {
 
 export function restoreLive(live, data) {
   if (!data || typeof data !== 'object') return null;
-  // drop fake signals saved by older versions: $0 dust and unverified balance guesses
-  if (Array.isArray(data.signals)) live.signals = data.signals.filter((x) => Number(x?.usdValue) >= 1 && !(x.source === 'balances' && String(x.signature || '').startsWith('bal-')));
+  // drop fake signals saved by older versions: $0 buy dust and unverified balance guesses (keep sells)
+  if (Array.isArray(data.signals)) live.signals = data.signals.filter((x) => (x?.side === 'sell' || Number(x?.usdValue) >= 1) && !(x.source === 'balances' && String(x.signature || '').startsWith('bal-')));
   const c = data.config || {};
   if (typeof c.enabled === 'boolean') live.config.enabled = c.enabled;
   // Older saves defaulted copying to OFF; only keep a value the user actually chose

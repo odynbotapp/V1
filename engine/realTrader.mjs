@@ -70,8 +70,19 @@ export function priorityMicroLamportsFor(priorityFee, cuUnits = 100_000, envOver
  * Transferred via SystemProgram.transfer inside the swap tx (+ `?bundleOnly=true`), so if a swap
  * reverts (e.g. 6042 price ceiling) the tip rolls back to 0 SOL.
  */
-export function jitoTipLamportsFor(priorityFee, { side = 'buy', tradeSol = null, hasJito = false, envTipLamports = null } = {}) {
-  if (side !== 'buy' || !hasJito) return 0;
+export function jitoTipLamportsFor(priorityFee, { side = 'buy', tradeSol = null, hasJito = false, envTipLamports = null, envSellTipLamports = null } = {}) {
+  if (!hasJito) return 0;
+  if (side === 'sell') {
+    if (envSellTipLamports !== null && envSellTipLamports !== undefined && String(envSellTipLamports).trim() !== '') {
+      const ov = Number(envSellTipLamports);
+      if (Number.isFinite(ov)) {
+        const n = Math.max(0, Math.floor(ov));
+        return n >= 1_000 ? n : 0;
+      }
+    }
+    return 0;
+  }
+  if (side !== 'buy') return 0;
   if (envTipLamports !== null && envTipLamports !== undefined && String(envTipLamports).trim() !== '') {
     const ov = Number(envTipLamports);
     if (Number.isFinite(ov)) {
@@ -276,7 +287,27 @@ export class RealTrader {
   }
 
   hasJitoEndpoint() {
-    return Array.isArray(this.fastRpcUrls) && this.fastRpcUrls.some((u) => /jito\.wtf/i.test(String(u)));
+    return Array.isArray(this.fastRpcUrls) && this.fastRpcUrls.some((u) => PD.detectRelayKind(u) !== 'swqos');
+  }
+
+  /** Fast broadcast URLs ordered by lowest measured live RTT (tie-breaking on original order). */
+  sortedFastRpcUrls() {
+    if (!Array.isArray(this.fastRpcUrls) || this.fastRpcUrls.length <= 1 || !this.endpointRttMs?.size) {
+      return this.fastRpcUrls || [];
+    }
+    return this.fastRpcUrls
+      .map((u, idx) => {
+        let rtt = Infinity;
+        try {
+          const origin = new URL(u).origin;
+          if (this.endpointRttMs.has(origin)) rtt = this.endpointRttMs.get(origin);
+        } catch {
+          // ignore invalid URL
+        }
+        return { u, idx, rtt };
+      })
+      .sort((a, b) => (a.rtt !== b.rtt ? a.rtt - b.rtt : a.idx - b.idx))
+      .map((x) => x.u);
   }
 
   get address() {
@@ -344,7 +375,7 @@ export class RealTrader {
   }
 
   /** Raw (integer) token balance of the bot wallet for one mint, across all its token accounts. */
-  async getTokenBalanceRaw(mint) {
+  async getTokenBalanceRaw(mint, { commitment = 'confirmed' } = {}) {
     const sum = (r, onlyMint) => {
       let raw = 0n;
       for (const acc of r?.value || []) {
@@ -356,7 +387,7 @@ export class RealTrader {
       }
       return raw;
     };
-    const r = await this.rpc('getTokenAccountsByOwner', [this.address, { mint }, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+    const r = await this.rpc('getTokenAccountsByOwner', [this.address, { mint }, { encoding: 'jsonParsed', commitment }]);
     const raw = sum(r, false);
     if (raw > 0n || mint === USDC_MINT) return raw;
     // Nothing found by mint: also look through every token account of both token programs.
@@ -365,13 +396,31 @@ export class RealTrader {
     let total = 0n;
     for (const programId of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
       try {
-        const all = await this.rpc('getTokenAccountsByOwner', [this.address, { programId }, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+        const all = await this.rpc('getTokenAccountsByOwner', [this.address, { programId }, { encoding: 'jsonParsed', commitment }]);
         total += sum(all, true);
       } catch {
         // try the other program
       }
     }
     return total;
+  }
+
+  /** Fetch a parsed transaction supporting version 1 and falling back to version 0 if the RPC rejects v1. */
+  async getTransactionParsed(signature) {
+    const versions = this.txVersion != null ? [this.txVersion] : [1, 0];
+    let lastErr = null;
+    for (const v of versions) {
+      try {
+        const tx = await this.rpc('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: v, commitment: 'confirmed' }]);
+        if (this.txVersion == null) this.txVersion = v;
+        return tx;
+      } catch (err) {
+        lastErr = err;
+        if (/version \(\d+\) is not supported/i.test(err?.message || '')) throw err;
+      }
+    }
+    if (lastErr) throw lastErr;
+    return null;
   }
 
   async refreshBalance({ solOnly = false } = {}) {
@@ -638,17 +687,22 @@ export class RealTrader {
       }
     }
     let warmed = 0;
+    if (!this.endpointRttMs) this.endpointRttMs = new Map();
     await Promise.allSettled(
       [...origins].map(async (origin) => {
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 3000);
         t.unref?.();
+        const t0 = this.now();
         try {
           await this.fetch(origin, {
             method: 'OPTIONS',
             keepalive: true,
             signal: ctrl.signal,
           });
+          const rtt = Math.max(0, this.now() - t0);
+          const prev = this.endpointRttMs.get(origin);
+          this.endpointRttMs.set(origin, prev !== undefined ? Math.round(prev * 0.6 + rtt * 0.4) : rtt);
           warmed += 1;
         } catch {
           // TLS handshake still warms the pool even if an endpoint rejects OPTIONS
@@ -911,13 +965,13 @@ export class RealTrader {
     const fastTc =
       token?.curve &&
       !token.curve.launchlab &&
-      (!token.curve.at || this.now() - Number(token.curve.at) < 2000) &&
+      (!token.curve.at || this.now() - Number(token.curve.at) < 4500) &&
       Number(token.curve.virtualSolReserves) > 0 &&
       Number(token.curve.virtualTokenReserves) > 0 &&
       !token.curve.mayhem &&
       !token.curve.cashback &&
       (side === 'buy'
-        ? Number(token.curve.realTokenReserves) > 0 && (token.curve.tokenProgram === PD.TOKEN_PROGRAM || token.curve.tokenProgram === PD.TOKEN_2022_PROGRAM || cachedMeta?.tokenProgram) && Number(this.balance?.sol) > 0
+        ? Number(token.curve.realTokenReserves) > 0 && !cachedMeta?.estimated && (token.curve.tokenProgram === PD.TOKEN_PROGRAM || token.curve.tokenProgram === PD.TOKEN_2022_PROGRAM || cachedMeta?.tokenProgram) && Number(this.balance?.sol) > 0
         : cachedMeta && cachedMeta.heldRaw > 0n && !cachedMeta.estimated && !activeBuying && (token.curve.tokenProgram === PD.TOKEN_PROGRAM || token.curve.tokenProgram === PD.TOKEN_2022_PROGRAM || cachedMeta.tokenProgram))
         ? token.curve
         : null;
@@ -940,8 +994,8 @@ export class RealTrader {
       };
       baseTokenProgram = fastTc.tokenProgram === PD.TOKEN_PROGRAM || fastTc.tokenProgram === PD.TOKEN_2022_PROGRAM ? fastTc.tokenProgram : cachedMeta.tokenProgram;
       userAta = baseTokenProgram === PD.TOKEN_2022_PROGRAM ? ata2022 : ataSpl;
-      ataExists = side === 'sell';
-      preTokens = side === 'sell' ? cachedMeta.heldRaw : 0n;
+      preTokens = cachedMeta?.heldRaw || 0n;
+      ataExists = side === 'sell' || preTokens > 0n;
       preLamports = BigInt(Math.round(Number(this.balance?.sol || 0) * 1e9));
       blockhash = await this.recentBlockhash().catch(() => null);
     } else {
@@ -1040,36 +1094,64 @@ export class RealTrader {
       const tradeSol = Number(side === 'buy' ? d.lamportsIn : d.lamportsOut) / LAMPORTS;
       const microLamports = this.priorityMicroLamports(units, side, tradeSol);
       priorityLamports = Math.ceil((units * Math.max(0, Number(microLamports) || 0)) / 1_000_000);
-      if (side === 'buy') {
+      {
         const rawTip = Math.max(0, Math.floor(Number(this.jitoTipLamports?.(side, tradeSol) || 0)));
         tipLamports = BigInt(rawTip >= 1_000 ? rawTip : 0);
         if (tipLamports > 0n && d.preLamports !== undefined) {
-          const room = d.preLamports - d.lamportsIn - 3_500_000n;
+          const spendNeed = side === 'buy' ? d.lamportsIn : 0n;
+          const room = d.preLamports - spendNeed - 3_500_000n;
           if (room < 1_000n) tipLamports = 0n;
           else if (tipLamports > room) tipLamports = room;
         }
       }
       const budget = PD.computeBudgetIxs({ units, microLamports });
+      const relayKinds = new Set((this.fastRpcUrls || []).map((u) => PD.detectRelayKind(u)).filter((k) => k !== 'swqos'));
+      const useRaceGuard = side === 'buy' && !d.ataExists && tipLamports >= 1_000n && (relayKinds.size > 1 || (relayKinds.size === 1 && !relayKinds.has('jito')));
+      const createAtaFn = useRaceGuard ? PD.createAtaIx : PD.createAtaIdempotentIx;
+      let coreIxs;
       if (side === 'buy') {
         minOut = (d.tokensOut * keep) / 10_000n;
         if (minOut <= 0n) return { fallback: true, error: 'minimum tokens is 0' };
-        ixs = [...budget, PD.createAtaIdempotentIx({ payer: this.address, owner: this.address, mint, tokenProgram: d.baseTokenProgram }), PD.buyExactQuoteInIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, lamportsIn: d.lamportsIn, minTokensOut: minOut, buybackFeeRecipient: buyback })];
-        if (tipLamports >= 1_000n) {
-          const tipTo = PD.JITO_TIP_ACCOUNTS[Math.floor(Math.random() * PD.JITO_TIP_ACCOUNTS.length)];
-          ixs.push(PD.systemTransferIx({ from: this.address, to: tipTo, lamports: tipLamports }));
-        }
+        coreIxs = [...budget, createAtaFn({ payer: this.address, owner: this.address, mint, tokenProgram: d.baseTokenProgram }), PD.buyExactQuoteInIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, lamportsIn: d.lamportsIn, minTokensOut: minOut, buybackFeeRecipient: buyback })];
       } else {
         minOut = (d.lamportsOut * keep) / 10_000n;
-        ixs = [...budget, PD.sellIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, amount: d.amount, minSolOutput: minOut, buybackFeeRecipient: buyback })];
+        coreIxs = [...budget, PD.sellIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, amount: d.amount, minSolOutput: minOut, buybackFeeRecipient: buyback })];
       }
+      ixs = [...coreIxs];
+      if (tipLamports >= 1_000n) {
+        const primaryKind = relayKinds.has('jito') || relayKinds.size === 0 ? 'jito' : [...relayKinds][0];
+        const tipPool = PD.RELAY_TIP_ACCOUNTS[primaryKind] || PD.JITO_TIP_ACCOUNTS;
+        const tipTo = tipPool[Math.floor(Math.random() * tipPool.length)];
+        ixs.push(PD.systemTransferIx({ from: this.address, to: tipTo, lamports: tipLamports }));
+      }
+      d._coreIxs = coreIxs;
+      d._useRaceGuard = useRaceGuard;
+      d._relayKinds = relayKinds;
     } catch (err) {
       return { fallback: true, error: `build: ${err.message}` };
     }
     let signed;
+    const variantByRelay = new Map();
+    const variantSigs = [];
     try {
       const blockhash = d.blockhash || (await this.recentBlockhash());
       const { message } = PD.compileMessage({ payer: this.address, instructions: ixs, recentBlockhash: blockhash });
       signed = PD.signLegacy(message, this.keypair);
+      if (d._useRaceGuard && d._relayKinds?.size > 0) {
+        const primaryKind = d._relayKinds.has('jito') ? 'jito' : [...d._relayKinds][0];
+        variantByRelay.set(primaryKind, signed.base64);
+        for (const kind of d._relayKinds) {
+          if (kind === primaryKind) continue;
+          const pool = PD.RELAY_TIP_ACCOUNTS[kind];
+          if (!pool?.length) continue;
+          const tipTo = pool[Math.floor(Math.random() * pool.length)];
+          const vIxs = [...d._coreIxs, PD.systemTransferIx({ from: this.address, to: tipTo, lamports: tipLamports })];
+          const { message: vMsg } = PD.compileMessage({ payer: this.address, instructions: vIxs, recentBlockhash: blockhash });
+          const vSigned = PD.signLegacy(vMsg, this.keypair);
+          variantByRelay.set(kind, vSigned.base64);
+          variantSigs.push(vSigned.signature);
+        }
+      }
     } catch (err) {
       return { fallback: true, error: `sign: ${err.message}` };
     }
@@ -1081,6 +1163,7 @@ export class RealTrader {
       for (const [k, t] of this.sentSigs) if (this.now() - t > 120_000) this.sentSigs.delete(k);
       if (this.sentSigs.has(signed.signature)) return { fallback: true, error: 'identical transaction already sent — not sending it twice' };
       this.sentSigs.set(signed.signature, this.now());
+      for (const vs of variantSigs) this.sentSigs.set(vs, this.now());
     }
     let fastSent = false;
     let fastSendStart = 0;
@@ -1090,10 +1173,12 @@ export class RealTrader {
     if (d.fastCurve) {
       fastSent = true;
       fastSendStart = this.now();
-      this.blastSignedTransaction(signed.base64, { bundleOnly });
+      this.blastSignedTransaction(signed.base64, { bundleOnly, variantByRelay });
       fastSendP = this.rpc('sendTransaction', [signed.base64, { encoding: 'base64', skipPreflight: true, maxRetries: 3 }]).catch(() => null);
       // Start signature confirmation micro-polling immediately in parallel with simulation & send
-      fastConfirmP = this.waitForSignature(fastSig, 25_000);
+      fastConfirmP = variantSigs.length
+        ? this.waitForAnySignature([fastSig, ...variantSigs], 25_000)
+        : this.waitForSignature(fastSig, 25_000).then((st) => ({ status: st, signature: fastSig }));
     }
     const simP = this.rpc('simulateTransaction', [signed.base64, { encoding: 'base64', commitment: 'processed', sigVerify: true, replaceRecentBlockhash: false, accounts: { encoding: 'base64', addresses: [this.address, d.userAta] } }]);
     // ----- simulate and check the balance changes -----
@@ -1127,9 +1212,9 @@ export class RealTrader {
       outAmount = tokDelta > 0n && (!d.fastCurve || tokDelta <= d.tokensOut) ? tokDelta : d.tokensOut;
     } else {
       if (!fastSent && -tokDelta !== d.amount) return { fallback: true, error: `simulation sold ${-tokDelta} tokens, expected ${d.amount}` };
-      if (!fastSent && solDelta < minOut - 200_000n) return { fallback: true, error: `simulation returned ${solDelta} lamports, under the minimum` };
+      if (!fastSent && solDelta < minOut - tipLamports - 200_000n) return { fallback: true, error: `simulation returned ${solDelta} lamports, under the minimum` };
       inAmount = d.amount;
-      outAmount = solDelta > 0n ? solDelta : d.lamportsOut;
+      outAmount = solDelta > 0n ? solDelta + tipLamports : d.lamportsOut;
     }
     let sendStart = fastSendStart;
     let sig = fastSig;
@@ -1145,8 +1230,9 @@ export class RealTrader {
       if (this.sentSigs.has(signed.signature)) return { fallback: true, error: 'identical transaction already sent — not sending it twice' };
       this.sentSigs.set(signed.signature, this.now());
       // ----- send (fast RPCs + main RPC in parallel) and confirm -----
+      for (const vs of variantSigs) this.sentSigs.set(vs, this.now());
       sendStart = this.now();
-      this.blastSignedTransaction(signed.base64, { bundleOnly });
+      this.blastSignedTransaction(signed.base64, { bundleOnly, variantByRelay });
       try {
         const r = await this.rpc('sendTransaction', [signed.base64, { encoding: 'base64', skipPreflight: true, maxRetries: 3 }]);
         if (typeof r === 'string') sig = r;
@@ -1154,7 +1240,18 @@ export class RealTrader {
         // the fast RPCs above still got it; the status check decides
       }
     }
-    const st = fastConfirmP ? await fastConfirmP : await this.waitForSignature(sig, 25_000);
+    let st;
+    if (fastConfirmP) {
+      const res = await fastConfirmP;
+      st = res.status;
+      if (res.signature) sig = res.signature;
+    } else if (variantSigs.length) {
+      const res = await this.waitForAnySignature([sig, ...variantSigs], 25_000);
+      st = res.status;
+      if (res.signature) sig = res.signature;
+    } else {
+      st = await this.waitForSignature(sig, 25_000);
+    }
     const sendMs = this.now() - sendStart;
     if (st === 'unknown') return { unknown: true, signature: sig, error: 'sent but not confirmed in 25 s' };
     if (st === 'failed') {
@@ -1305,7 +1402,7 @@ export class RealTrader {
       if (since && x.blockTime && x.blockTime * 1000 < since - 60_000) continue;
       let tx;
       try {
-        tx = await this.rpc('getTransaction', [x.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]);
+        tx = await this.getTransactionParsed(x.signature);
       } catch {
         continue;
       }
@@ -1329,7 +1426,6 @@ export class RealTrader {
     const onchain = txCount ? { netSol, txCount } : null;
     if (signatures.length) return { held: 0n, onchain, sale: { signature: signatures[0], signatures, receivedSol, t: lastT || this.now() } };
     return { held: 0n, onchain, sale: null };
-    return { held: 0n, sale: null };
   }
 
   /** How many raw tokens to sell: never more than the wallet holds. */
@@ -1348,19 +1444,30 @@ export class RealTrader {
    * configured fast RPCs (Helius, Alchemy, Jito Block Engine) in parallel with Jupiter `/execute`
    * so the transaction reaches the Solana leader in milliseconds.
    */
-  blastSignedTransaction(signedBase64, { bundleOnly = false } = {}) {
+  blastSignedTransaction(signedBase64, { bundleOnly = false, variantByRelay = null } = {}) {
     if (!this.fastRpcUrls?.length) return;
-    const payload = JSON.stringify({
+    const defaultPayload = JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'sendTransaction',
       params: [signedBase64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
     });
-    for (const rawUrl of this.fastRpcUrls) {
+    for (const rawUrl of this.sortedFastRpcUrls()) {
       let url = rawUrl;
-      if (bundleOnly && /jito\.wtf\/api\/v1\/transactions/i.test(String(rawUrl)) && !/[?&]bundleOnly=/i.test(String(rawUrl))) {
+      const relayKind = PD.detectRelayKind(rawUrl);
+      if (bundleOnly && relayKind === 'jito' && !/[?&]bundleOnly=/i.test(String(rawUrl))) {
         url = `${rawUrl}${String(rawUrl).includes('?') ? '&' : '?'}bundleOnly=true`;
       }
+      const txB64 = variantByRelay?.get(relayKind) || signedBase64;
+      const payload =
+        txB64 === signedBase64
+          ? defaultPayload
+          : JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'sendTransaction',
+              params: [txB64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
+            });
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 5000);
       t.unref?.();
@@ -1861,6 +1968,81 @@ export class RealTrader {
   }
 
   /**
+   * Race confirmation across multiple relay-variant signatures in a single batched RPC poll + WS push:
+   * the first variant to land as 'success' wins immediately; 'failed' is only returned if all variants fail.
+   */
+  async waitForAnySignature(signatures, maxMs) {
+    const sigs = [...new Set((signatures || []).filter(Boolean))];
+    if (sigs.length <= 1) {
+      const status = await this.waitForSignature(sigs[0], maxMs);
+      return { status, signature: sigs[0] };
+    }
+    for (const s of sigs) {
+      const hit = this.resolvedSigs?.get(s);
+      if (hit && this.now() - hit.at < 60_000 && hit.status === 'success') {
+        return { status: 'success', signature: s };
+      }
+    }
+    const failedSigs = new Set();
+    let done = false;
+    let wakeSleep = null;
+    const watches = sigs.map((s) => this.watchSignatureOnce(s));
+    const wsPromises = watches.map((w, idx) =>
+      w.promise.then((st) => {
+        if (st === 'success') return { status: 'success', signature: sigs[idx] };
+        failedSigs.add(sigs[idx]);
+        if (failedSigs.size >= sigs.length) return { status: 'failed', signature: sigs[0] };
+        return new Promise(() => {});
+      })
+    );
+    const pollP = (async () => {
+      const until = this.now() + maxMs;
+      let step = 0;
+      while (!done && this.now() < until) {
+        try {
+          const r = await this.rpc('getSignatureStatuses', [sigs, { searchTransactionHistory: true }]);
+          const list = r?.value || [];
+          for (let i = 0; i < sigs.length; i++) {
+            const st = list[i];
+            const s = sigs[i];
+            if (!st) continue;
+            if (st.err) {
+              if (!this.lastSigErrors) this.lastSigErrors = new Map();
+              if (this.lastSigErrors.size > 200) this.lastSigErrors.clear();
+              this.lastSigErrors.set(s, st.err);
+              failedSigs.add(s);
+            } else if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') {
+              return { status: 'success', signature: s };
+            }
+          }
+          if (failedSigs.size >= sigs.length) {
+            return { status: 'failed', signature: sigs[0] };
+          }
+        } catch {
+          // keep trying
+        }
+        if (done) break;
+        const waitMs = step < 4 ? 35 : step < 10 ? 65 : 100;
+        step += 1;
+        await Promise.race([
+          this.sleep(waitMs),
+          new Promise((r) => {
+            wakeSleep = r;
+          }),
+        ]);
+      }
+      return { status: failedSigs.size >= sigs.length ? 'failed' : 'unknown', signature: sigs[0] };
+    })();
+    try {
+      return await Promise.race([...wsPromises, pollP]);
+    } finally {
+      done = true;
+      wakeSleep?.();
+      for (const w of watches) w.cancel();
+    }
+  }
+
+  /**
    * Exact amounts: Jupiter's execute result where present, the on-chain transaction for the
    * network fee (fee + priority + new token-account rent).
    */
@@ -1888,7 +2070,7 @@ export class RealTrader {
     const waitMs = haveExecAmounts ? 45 : 200;
     for (let i = 0; i < maxTries && !tx; i++) {
       try {
-        tx = await this.rpc('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]);
+        tx = await this.getTransactionParsed(signature);
       } catch {
         tx = null;
       }
@@ -1946,13 +2128,20 @@ export class RealTrader {
       // getTransaction not indexed yet: read live token balance directly from AccountsDB (0 ms indexing lag)
       const pre = preTokens !== null && preTokens !== undefined ? BigInt(preTokens) : 0n;
       if (side === 'buy') {
-        const liveHeld = await this.getTokenBalanceRaw(mint).catch(() => 0n);
+        let liveHeld = await this.getTokenBalanceRaw(mint).catch(() => 0n);
+        if (liveHeld <= pre && fastCurve && this.fastRpcUrls?.length > 0) {
+          liveHeld = await this.getTokenBalanceRaw(mint, { commitment: 'processed' }).catch(() => 0n);
+        }
         if (liveHeld > pre) {
           outputRaw = liveHeld - pre;
           postTokenRaw = liveHeld;
         }
       } else {
-        const liveHeld = await this.getTokenBalanceRaw(mint).catch(() => null);
+        let liveHeld = await this.getTokenBalanceRaw(mint).catch(() => null);
+        if (liveHeld !== null && liveHeld >= pre && fastCurve && this.fastRpcUrls?.length > 0) {
+          const procHeld = await this.getTokenBalanceRaw(mint, { commitment: 'processed' }).catch(() => null);
+          if (procHeld !== null && procHeld < pre) liveHeld = procHeld;
+        }
         if (liveHeld !== null) {
           postTokenRaw = liveHeld;
           if (pre > liveHeld) inputRaw = pre - liveHeld;

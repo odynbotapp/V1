@@ -95,6 +95,9 @@ export class LiveSignalService {
       const fs = this.engine.follows.filter((f) => f.chainId === 'solana' && f.traderWallet === addr && f.status === 'copying');
       return fs.length > 0 && fs.every((f) => f.mode === 'auto-exit');
     };
+    this.watcher.allowTokenToToken = true;
+    this.watcher.holdsToken = (addr, mint) =>
+      (this.engine.positions || []).some((p) => p.chainId === 'solana' && p.tokenAddress === mint && p.remainingTokens > 0 && (!p.traderWallet || p.traderWallet === addr));
     // fast trade detection: a copied trade whose trader trade never confirmed is closed
     this.watcher.onPhantomTrade = (p) => {
       const s = this.signals.find((x) => x.signature === p.signature);
@@ -199,7 +202,7 @@ export class LiveSignalService {
 
   purgeFake() {
     const before = this.signals.length;
-    this.signals = this.signals.filter((x) => Number(x?.usdValue) >= 1 && !(x.source === 'balances' && String(x.signature || '').startsWith('bal-')));
+    this.signals = this.signals.filter((x) => (x?.side === 'sell' || Number(x?.usdValue) >= 1) && !(x.source === 'balances' && String(x.signature || '').startsWith('bal-')));
     this.pushStatus(true);
     return before - this.signals.length;
   }
@@ -297,8 +300,9 @@ export class LiveSignalService {
   }
 
   async handleSignalNow(sig) {
-    // dust (under $1) is never a real copy-worthy trade; keep it out of the feed
-    if (!(Number(sig.usdValue) >= 1)) {
+    // Sells are never ignored as dust (a coin that crashed >95% can be sold by the trader for < $1,
+    // and we must still mirror the exit and reset their copied cycle).
+    if (sig.side !== 'sell' && !(Number(sig.usdValue) >= 1)) {
       (this.dustSigs || (this.dustSigs = new Set())).add(sig.signature); // remembered for the missed-trade audit
       return;
     }
@@ -336,33 +340,28 @@ export class LiveSignalService {
     }
 
     if (willCopy) {
-      // Each follow is matched by WALLET only and copies with its own settings
+      // Each follow is matched by WALLET only and copies in parallel with its own settings
       record.copies = [];
-      for (const f of follows) {
-        const es = this.toEngineSignal(sig, f);
-        let r;
-        try {
-          r = sig.side === 'buy' ? await this.engine.handleLeaderBuySignal(f, es) : await this.engine.handleLeaderSellSignal(f, es);
-        } catch (err) {
-          r = { status: 'error', reason: err.message };
-        }
-        const ok = r?.status === 'filled' || r?.ok === true;
-        // copy speed, measured: signal ready → copy finished (includes the swap for real copies)
-        const handledMs = sig.detectedAt ? Date.now() - sig.detectedAt : null;
+      const copyResults = await Promise.all(
+        follows.map(async (f) => {
+          const es = this.toEngineSignal(sig, f);
+          let r;
+          try {
+            r = sig.side === 'buy' ? await this.engine.handleLeaderBuySignal(f, es) : await this.engine.handleLeaderSellSignal(f, es);
+          } catch (err) {
+            r = { status: 'error', reason: err.message };
+          }
+          const ok = r?.status === 'filled' || r?.ok === true;
+          // copy speed, measured: signal ready → copy finished (includes the swap for real copies)
+          const handledMs = sig.detectedAt ? Date.now() - sig.detectedAt : null;
+          return { f, r, ok, handledMs };
+        })
+      );
+      for (const { f, r, ok, handledMs } of copyResults) {
         record.copies.push({ followId: f.id, handle: f.handle, ok, status: r?.status || null, reason: r?.reason || null, handledMs });
         record.decisions.push({ followId: f.id, handle: f.handle, followStatus: f.status, status: ok ? 'copied' : r?.status || null, reason: r?.reason || null, sizeUsd: null, chaseGapPct: r?.chaseGapPct ?? null });
       }
       record.paperCopied = record.copies.some((c) => c.ok);
-    }
-
-    // Event-driven 0ms auto-exit check: if any existing open position in this token crossed TP/SL/Trail on this live trade, evaluate immediately
-    if (!sig.backfill && sig.tokenMint && typeof this.engine.evaluatePositionExits === 'function') {
-      const now = Date.now();
-      for (const pos of this.engine.positions || []) {
-        if (pos.tokenAddress === sig.tokenMint && pos.remainingTokens > 0 && now - (pos.openedAt || 0) >= 500) {
-          await this.engine.evaluatePositionExits(pos, now).catch(() => {});
-        }
-      }
     }
 
     // Dax's trader log: what the trader did and what each follow did about it
@@ -380,6 +379,15 @@ export class LiveSignalService {
     this.signals.unshift(record);
     if (this.signals.length > MAX_SIGNALS) this.signals.length = MAX_SIGNALS;
     this.broadcast({ event: 'live_signal', data: record, liveWatch: this.snapshot(false) });
+
+    // Event-driven 0ms auto-exit check: if any existing open position in this token crossed TP/SL/Trail on this live trade, evaluate immediately (sequentially for the same real token so balances never race)
+    if (!sig.backfill && sig.tokenMint && typeof this.engine.evaluatePositionExits === 'function') {
+      const now = Date.now();
+      const targets = (this.engine.positions || []).filter((pos) => pos.tokenAddress === sig.tokenMint && pos.remainingTokens > 0 && now - (pos.openedAt || 0) >= 500);
+      for (const pos of targets) {
+        await this.engine.evaluatePositionExits(pos, now).catch(() => {});
+      }
+    }
   }
 
   pushStatus(force = false) {

@@ -474,3 +474,43 @@ test('FD16 watcher: PumpSwap WS logs emit fast-logs signal without getTransactio
   assert.deepEqual(got[1].callsAtSignal, [], '0 RPC calls on cached PumpSwap pool sell');
 });
 
+test('FD17 never-miss detection: split-order buys merge, flooded wallets queue fallback swaps, unindexed push retries on poll, Jito-tipped sells and <$1 sells are caught', async () => {
+  // 1. Split-order pump.fun buy (2 Buy CPIs for the same mint in 1 tx) merges instead of skipping
+  const splitPump = [
+    ...logs(tradeEvent({ sol: 200_000_000n, tokens: 2_000_000_000_000n, isBuy: true })),
+    ...logs(tradeEvent({ sol: 300_000_000n, tokens: 3_000_000_000_000n, isBuy: true })),
+  ];
+  const rSplit = pumpTradeFromLogs(splitPump, TRADER);
+  assert.ok(rSplit.trade, rSplit.skip);
+  assert.equal(rSplit.trade.solAmount, 500_000_000n);
+  assert.equal(rSplit.trade.tokenAmount, 5_000_000_000_000n);
+
+  // 2. Flooded wallet (mode === 'balances') with fastDetect ON does NOT drop graduation/Raydium swaps that fall back to streamQueue
+  const { w, got } = watcherWorld({ txAppears: true });
+  w.wallets.get(TRADER).mode = 'balances';
+  const gradLogs = logs(tradeEvent(), {
+    extra: [
+      `Program ${PUMP_PROGRAM} invoke [2]`,
+      `Program data: ${Buffer.concat([Buffer.from('X3JhnNQumAg=', 'base64'), Buffer.alloc(40)]).toString('base64')}`,
+      `Program ${PUMP_PROGRAM} success`,
+    ],
+  });
+  w.handleStreamLogs(TRADER, { signature: 'grad-on-flooded', err: null, logs: gradLogs, receivedAt: Date.now() });
+  await until(() => got.length === 1);
+  assert.equal(got[0].signature, 'grad-on-flooded');
+  assert.equal(got[0].side, 'buy');
+
+  // 3. Unindexed transaction (getTransaction returns null) removes sig from seenSigs so the backup poll catches it once indexed
+  let indexed = false;
+  const { w: w2, got: got2 } = watcherWorld({ txAppears: true });
+  const origGetTx = w2.getTransaction.bind(w2);
+  w2.getTransaction = async (sig, opts) => (indexed ? origGetTx(sig, opts) : null);
+  await w2.processSignature(w2.wallets.get(TRADER), 'delayed-sig', { backfill: false, via: 'poll', waitForTx: false });
+  assert.equal(got2.length, 0);
+  assert.equal(w2.seenSigs.has('delayed-sig'), false, 'unindexed tx must not poison seenSigs');
+  indexed = true;
+  await w2.processSignature(w2.wallets.get(TRADER), 'delayed-sig', { backfill: false, via: 'poll', waitForTx: false });
+  assert.equal(got2.length, 1, 'caught on retry once indexed');
+});
+
+

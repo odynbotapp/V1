@@ -128,10 +128,23 @@ const DEFAULT_JITO_ENDPOINTS = [
   'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
   'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/transactions',
   'https://slc.mainnet.block-engine.jito.wtf/api/v1/transactions',
+  'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/transactions',
+  'https://london.mainnet.block-engine.jito.wtf/api/v1/transactions',
+  'https://dublin.mainnet.block-engine.jito.wtf/api/v1/transactions',
 ];
 const jitoEndpoints = [
   ...(process.env.ODEX_JITO_RPC_URL ? [String(process.env.ODEX_JITO_RPC_URL).trim()] : []),
   ...DEFAULT_JITO_ENDPOINTS,
+].filter(Boolean);
+const extraSwqosEndpoints = [
+  ...(String(process.env.ODEX_SWQOS_RPC_URLS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)),
+  process.env.NOZOMI_RPC_URL ? String(process.env.NOZOMI_RPC_URL).trim() : null,
+  process.env.ASTRALANE_RPC_URL ? String(process.env.ASTRALANE_RPC_URL).trim() : null,
+  process.env.NEXTBLOCK_RPC_URL ? String(process.env.NEXTBLOCK_RPC_URL).trim() : null,
+  process.env.BLOCKRAZOR_RPC_URL ? String(process.env.BLOCKRAZOR_RPC_URL).trim() : null,
 ].filter(Boolean);
 // Sodae (optional): also receives our signed swaps (one credit each) — never used for routine reads,
 // so the free tier's 100k monthly credits last
@@ -147,7 +160,7 @@ const heliusConfirmWs = heliusApiKey ? `wss://mainnet.helius-rpc.com/?api-key=${
 export const realTrader = new RealTrader({
   env: process.env,
   rpc: (method, params) => liveSignals.watcher.rpc(method, params, { fast: true }),
-  fastRpcUrls: [heliusSenderRpc, heliusStakedRpc, heliusFastRpc, liveSignals.watcher.rpcUrl, ...jitoEndpoints, sodaeRpc].filter(Boolean),
+  fastRpcUrls: [heliusSenderRpc, heliusStakedRpc, heliusFastRpc, liveSignals.watcher.rpcUrl, ...jitoEndpoints, ...extraSwqosEndpoints, sodaeRpc].filter(Boolean),
   confirmWsUrl: heliusConfirmWs,
   solPrice: () => (solPriceLive ? CHAINS.solana.nativePriceUsd : 0),
   state: db ? db.get('realTrader') : null,
@@ -166,20 +179,28 @@ realTrader.capsOverride = () => engine.settings.realCaps || null;
 // Swap route (Settings → Trading & risk): Jupiter (default) or direct pump.fun with Jupiter fallback.
 // ODEX_SWAP_ROUTE=jupiter on Railway forces Jupiter whatever the setting says (emergency switch).
 realTrader.routeSetting = () => (process.env.ODEX_SWAP_ROUTE === 'jupiter' ? 'jupiter' : engine.settings.swapRoute === 'direct' ? 'direct' : 'jupiter');
-// Fast trade detection (Settings → Trading & risk): pump.fun + PumpSwap trades read from the pushed logs.
+// Fast trade detection (Settings → Trading & risk): pump.fun + PumpSwap trades read from the pushed logs (on by default).
 // ODEX_FAST_DETECT=off on Railway turns it off whatever the setting says (emergency switch).
-liveSignals.watcher.fastDetect = () => process.env.ODEX_FAST_DETECT !== 'off' && engine.settings.fastDetect === true;
+liveSignals.watcher.fastDetect = () => process.env.ODEX_FAST_DETECT !== 'off' && engine.settings.fastDetect !== false;
+liveSignals.watcher.ownWalletAddress = realTrader.address || null;
 liveSignals.watcher.onWalletTx = (address, ev) => {
   if (realTrader.address && address === realTrader.address && ev?.signature && ev?.tx) {
+    const keys = ev.tx?.transaction?.message?.accountKeys;
+    if (Array.isArray(keys) && keys.length > 0) {
+      const hasOwn = keys.some((k) => (typeof k === 'string' ? k : k?.pubkey) === realTrader.address);
+      if (!hasOwn) return;
+    }
     realTrader.cacheOwnTransaction(ev.signature, ev.tx);
   }
 };
+liveSignals.watcher.syncStreams();
 realTrader.jitoTipLamports = (side, tradeSol) =>
   jitoTipLamportsFor(engine.settings.priorityFee, {
     side,
     tradeSol,
     hasJito: realTrader.hasJitoEndpoint(),
     envTipLamports: process.env.ODEX_JITO_TIP_LAMPORTS,
+    envSellTipLamports: process.env.ODEX_JITO_SELL_TIP_LAMPORTS,
   });
 realTrader.priorityMicroLamports = (units, side, tradeSol) => {
   const tipLamports = realTrader.jitoTipLamports(side, tradeSol);
@@ -188,6 +209,7 @@ realTrader.priorityMicroLamports = (units, side, tradeSol) => {
 };
 realTrader.startBlockhashWarmer();
 realTrader.startConnectionWarmer();
+if (realTrader.ready()) realTrader.refreshBalance({ solOnly: true }).catch(() => {});
 
 engine.adapter.liveHooks = realTrader.hooks();
 // Paper Mode on Solana: match real-SOL confirmed execution (~650–850 ms on direct pump.fun curve, ~950–1,000 ms on Jupiter)
@@ -652,6 +674,9 @@ async function refreshSolPrice() {
     }
   } catch {
     // keep the last known price
+  }
+  if (!solPriceLive) {
+    setTimeout(refreshSolPrice, 3000).unref?.();
   }
 }
 refreshSolPrice();

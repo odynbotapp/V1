@@ -188,15 +188,53 @@ export function parseSwapFromTransaction(tx, wallet) {
   // ignore dust sent along with a real trade (copy-bot bait: e.g. +0.04 of another token in every buy)
   tokenMoves = dropDustMoves(tokenMoves, (t) => t.delta);
 
+  const swapVenue = keys.includes(PUMP_CURVE_PROGRAM) ? 'pumpfun' : keys.includes(PUMP_AMM_PROGRAM) ? 'pumpswap' : keys.includes(RAYDIUM_LAUNCHLAB_PROGRAM) ? 'launchlab' : null;
+  const llEv = swapVenue === 'launchlab' && Array.isArray(meta.logMessages) ? launchLabTradeFromLogs(meta.logMessages) : null;
+  const pumpLogRes = (swapVenue === 'pumpfun' || swapVenue === 'launchlab') && Array.isArray(meta.logMessages) ? pumpTradeFromLogs(meta.logMessages, wallet) : null;
+  const psLogRes = swapVenue === 'pumpswap' && Array.isArray(meta.logMessages) ? pumpSwapTradeFromLogs(meta.logMessages, wallet) : null;
+
+  if (tokenMoves.length > 1 && pumpLogRes?.trade?.mint) {
+    const verifiedOnly = tokenMoves.filter((t) => t.mint === pumpLogRes.trade.mint);
+    if (verifiedOnly.length === 1) tokenMoves = verifiedOnly;
+  }
+
   if (tokenMoves.length === 0) return { skip: 'no token bought or sold (transfer, stake or SOL/stable only)' };
   if (tokenMoves.length > 1) {
-    const plus = tokenMoves.filter((t) => t.delta > 0).length;
-    const minus = tokenMoves.filter((t) => t.delta < 0).length;
-    return { skip: plus && minus ? 'token-to-token swap (not copied)' : 'multiple tokens moved' };
+    const plus = tokenMoves.filter((t) => t.delta > 0);
+    const minus = tokenMoves.filter((t) => t.delta < 0);
+    if (plus.length === 1 && minus.length === 1) {
+      const sold = minus[0];
+      const bought = plus[0];
+      const before = preTotals.get(sold.mint) || 0;
+      const sellSharePct = before > 0 ? Math.min(100, Number(((Math.abs(sold.delta) / before) * 100).toFixed(2))) : 100;
+      return {
+        skip: 'token-to-token swap (not copied)',
+        tokenToToken: {
+          soldMint: sold.mint,
+          soldDecimals: decimalsByMint.get(sold.mint) ?? (/pump$/i.test(sold.mint) ? 6 : null),
+          soldAmount: Math.abs(sold.delta),
+          heldBefore: before,
+          sellSharePct,
+          boughtMint: bought.mint,
+          boughtDecimals: decimalsByMint.get(bought.mint) ?? (/pump$/i.test(bought.mint) ? 6 : null),
+          boughtAmount: Math.abs(bought.delta),
+          boughtHeldBefore: preTotals.get(bought.mint) || 0,
+          blockTime: tx.blockTime ? tx.blockTime * 1000 : null,
+          slot: tx.slot ?? null,
+          signature: tx.transaction.signatures?.[0] || null,
+          venue: swapVenue,
+        },
+      };
+    }
+    return { skip: plus.length && minus.length ? 'token-to-token swap (not copied)' : 'multiple tokens moved' };
   }
 
   const tok = tokenMoves[0];
   const side = tok.delta > 0 ? 'buy' : 'sell';
+  const pumpEv = pumpLogRes?.trade && pumpLogRes.trade.mint === tok.mint ? pumpLogRes.trade : null;
+  const psEv = psLogRes?.trade || null;
+  const txTokenProg = keys.includes(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : keys.includes(TOKEN_PROGRAM) ? TOKEN_PROGRAM : null;
+  const llSol = llEv && llEv.poolSolLamports > 0 ? llEv.poolSolLamports / LAMPORTS_PER_SOL : null;
 
   // Quote leg: a stablecoin moving the opposite way wins, otherwise SOL
   let quote = null;
@@ -211,6 +249,16 @@ export function parseSwapFromTransaction(tx, wallet) {
     }
     if ((side === 'buy' && sol < -SOL_DUST) || (side === 'sell' && sol > SOL_DUST)) {
       quote = { symbol: 'SOL', mint: WSOL_MINT, amount: Math.abs(sol) };
+    } else {
+      const pumpSol = pumpEv && pumpEv.solAmount > 0n ? Number(pumpEv.solAmount) / LAMPORTS_PER_SOL : null;
+      const psSol = psEv && psEv.quoteAmount > 0n ? Number(psEv.quoteAmount) / LAMPORTS_PER_SOL : null;
+      const rawKeys = tx.transaction.message?.accountKeys || [];
+      const signedByWallet = rawKeys.some((k, i) => keyOf(k) === wallet && (typeof k === 'object' && 'signer' in k ? Boolean(k.signer) : i === 0));
+      const poolLegFallback = signedByWallet && swapVenue ? poolSolLeg(tx, wallet, { side, mint: tok.mint, venue: swapVenue, walletSol: 1e9 }) : null;
+      const recoveredSol = pumpSol || psSol || llSol || poolLegFallback;
+      if (recoveredSol && recoveredSol > SOL_DUST) {
+        quote = { symbol: 'SOL', mint: WSOL_MINT, amount: recoveredSol };
+      }
     }
   }
 
@@ -219,12 +267,6 @@ export function parseSwapFromTransaction(tx, wallet) {
   }
 
   // price from the pool leg (excludes fees, tips and deposits); SOL-quoted trades only
-  const swapVenue = keys.includes(PUMP_CURVE_PROGRAM) ? 'pumpfun' : keys.includes(PUMP_AMM_PROGRAM) ? 'pumpswap' : keys.includes(RAYDIUM_LAUNCHLAB_PROGRAM) ? 'launchlab' : null;
-  const llEv = swapVenue === 'launchlab' && Array.isArray(meta.logMessages) ? launchLabTradeFromLogs(meta.logMessages) : null;
-  const pumpLogRes = swapVenue === 'pumpfun' && Array.isArray(meta.logMessages) ? pumpTradeFromLogs(meta.logMessages, wallet) : null;
-  const pumpEv = pumpLogRes?.trade && pumpLogRes.trade.mint === tok.mint ? pumpLogRes.trade : null;
-  const txTokenProg = keys.includes(TOKEN_2022_PROGRAM) ? TOKEN_2022_PROGRAM : keys.includes(TOKEN_PROGRAM) ? TOKEN_PROGRAM : null;
-  const llSol = llEv && llEv.poolSolLamports > 0 ? llEv.poolSolLamports / LAMPORTS_PER_SOL : null;
   const poolQuote =
     quote.symbol === 'SOL'
       ? llSol > 0 && llSol <= quote.amount * 1.05 + 1e-9
@@ -476,7 +518,7 @@ export class SolanaWalletWatcher {
     onStatus = () => {},
     pollIntervalMs = 15_000,
     backfillCount = 3,
-    maxTxPerWalletPerPoll = 60,
+    maxTxPerWalletPerPoll = 100,
     walletBudgetMs = 25_000,
     stream = true,
     WebSocketImpl = globalThis.WebSocket,
@@ -658,8 +700,10 @@ export class SolanaWalletWatcher {
     if (on) this.stream.start();
     else this.stream.stop();
     if (this.grpcFeed) {
-      // failed transactions are filtered out at the source, so even flooded wallets are cheap here
-      this.grpcFeed.setWallets(all);
+      // failed transactions are filtered out at the source, so even flooded wallets are cheap here;
+      // include the bot's own wallet (if configured) so ownTxCache gets 0-RPC fill deltas on our swaps
+      const grpcWallets = this.ownWalletAddress && isSolanaAddress(this.ownWalletAddress) && !all.includes(this.ownWalletAddress) ? [...all, this.ownWalletAddress] : all;
+      this.grpcFeed.setWallets(grpcWallets);
       if (on && all.length) this.grpcFeed.start();
       else this.grpcFeed.stop();
     }
@@ -726,20 +770,21 @@ export class SolanaWalletWatcher {
 
   /** A pushed transaction that mentions a watched wallet. */
   handleStreamLogs(address, ev, feed = 'main') {
-    const w = this.wallets.get(address);
-    if (!w || !ev?.signature) return;
-    // which live feed heard this transaction first (main = Helius, extra = Sodae)
-    if ((this.extraStream || this.grpcFeed) && !this.firstSeenBy.has(ev.signature)) {
-      this.firstSeenBy.set(ev.signature, feed);
-      if (!ev.err) this.feedRace[feed] = (this.feedRace[feed] || 0) + 1;
-      if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
-    }
+    if (!ev?.signature) return;
     if (!ev.err && ev.tx && typeof this.onWalletTx === 'function') {
       try {
         this.onWalletTx(address, ev);
       } catch {
         // ignore listener errors
       }
+    }
+    const w = this.wallets.get(address);
+    if (!w) return;
+    // which live feed heard this transaction first (main = Helius, extra = Sodae)
+    if ((this.extraStream || this.grpcFeed) && !this.firstSeenBy.has(ev.signature)) {
+      this.firstSeenBy.set(ev.signature, feed);
+      if (!ev.err) this.feedRace[feed] = (this.feedRace[feed] || 0) + 1;
+      if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
     }
     if (ev.err) {
       this.streamStats.failedTx += 1; // failed transaction (spam floods are mostly these)
@@ -751,7 +796,7 @@ export class SolanaWalletWatcher {
       return;
     }
     this.streamStats.swapsSeen += 1;
-    const hasPumpCurveLog = Array.isArray(ev.logs) && ev.logs.some((l) => String(l).includes(PUMP_CURVE_PROGRAM));
+    const hasPumpCurveLog = Array.isArray(ev.logs) && ev.logs.some((l) => String(l).includes(PUMP_CURVE_PROGRAM) || String(l).includes(RAYDIUM_LAUNCHLAB_PROGRAM));
     const hasPumpSwapLog = Array.isArray(ev.logs) && ev.logs.some((l) => String(l).includes(PUMP_AMM_PROGRAM));
     if (this.fastDetect() && hasPumpCurveLog) {
       const r = pumpTradeFromLogs(ev.logs, address, { err: ev.err });
@@ -775,12 +820,14 @@ export class SolanaWalletWatcher {
         return;
       }
       const swap = parseSwapFromTransaction(ev.tx, address);
-      if (!swap || swap.skip) {
+      if (!swap || (swap.skip && !(swap.tokenToToken && this.allowTokenToToken))) {
         this.seenSigs.add(ev.signature);
         return;
       }
-      this.fastTxTrade(w, ev, swap);
-      return;
+      if (!swap.skip) {
+        this.fastTxTrade(w, ev, swap);
+        return;
+      }
     }
     if (this.fastDetect() && hasPumpSwapLog) {
       const ps = pumpSwapTradeFromLogs(ev.logs, address, { err: ev.err });
@@ -792,33 +839,50 @@ export class SolanaWalletWatcher {
       this.fastStats.misses += 1;
       this.fastStats.missReasons[ps.skip] = (this.fastStats.missReasons[ps.skip] || 0) + 1;
     }
-    if (w.mode === 'balances' && this.fastDetect()) return;
+    if (w.mode === 'balances') {
+      const queuedForWallet = this.streamQueue.reduce((n, item) => (item.w.address === w.address ? n + 1 : n), 0);
+      if (queuedForWallet >= 8) {
+        this.fastCheck(w, ev.receivedAt || Date.now(), 0, Number.isFinite(ev.slot) ? ev.slot : null);
+        return;
+      }
+    }
     this.streamQueue.push({ w, ev });
     if (this.streamQueue.length > 200) this.streamQueue.splice(0, this.streamQueue.length - 200);
     this.drainStream();
   }
 
   /** Resolve and cache { baseMint, quoteMint, decimals } for a PumpSwap pool account. */
-  async resolvePumpSwapPool(pool) {
+  async resolvePumpSwapPool(pool, ev = null) {
     const hit = this.pumpSwapPoolCache.get(pool);
     if (hit) return hit;
+    const txMeta = ev?.tx?.meta;
+    if (txMeta) {
+      const poolBalances = [...(txMeta.postTokenBalances || []), ...(txMeta.preTokenBalances || [])].filter((b) => b?.owner === pool && b?.mint);
+      const mints = [...new Set(poolBalances.map((b) => b.mint))];
+      if (mints.length === 2 && mints.includes(WSOL_MINT)) {
+        const tokenMint = mints.find((m) => m !== WSOL_MINT);
+        const tokBal = poolBalances.find((b) => b.mint === tokenMint);
+        const decimals = Number.isInteger(tokBal?.uiTokenAmount?.decimals) ? tokBal.uiTokenAmount.decimals : 6;
+        const info = { baseMint: tokenMint, quoteMint: WSOL_MINT, decimals };
+        this.pumpSwapPoolCache.set(pool, info);
+        return info;
+      }
+    }
     const acc = await this.rpc('getAccountInfo', [pool, { encoding: 'base64', commitment: 'processed' }], { fast: true });
     const val = acc?.value;
     if (!val || val.owner !== PUMP_AMM_PROGRAM) return null;
     const decoded = decodePumpSwapPool(val.data?.[0]);
     if (!decoded) return null;
     const mint = decoded.quoteMint === WSOL_MINT ? decoded.baseMint : decoded.baseMint === WSOL_MINT ? decoded.quoteMint : null;
-    let decimals = 6;
+    const info = { ...decoded, decimals: 6 };
     if (mint && !/pump$/i.test(mint)) {
-      try {
-        const mAcc = await this.rpc('getAccountInfo', [mint, { encoding: 'base64', commitment: 'processed' }], { fast: true });
-        const mb = mAcc?.value?.data?.[0] ? Buffer.from(mAcc.value.data[0], 'base64') : null;
-        if (mb && mb.length >= 45 && mb[44] <= 18) decimals = mb[44];
-      } catch {
-        // default 6
-      }
+      this.rpc('getAccountInfo', [mint, { encoding: 'base64', commitment: 'processed' }], { fast: true })
+        .then((mAcc) => {
+          const mb = mAcc?.value?.data?.[0] ? Buffer.from(mAcc.value.data[0], 'base64') : null;
+          if (mb && mb.length >= 45 && mb[44] <= 18) info.decimals = mb[44];
+        })
+        .catch(() => {});
     }
-    const info = { ...decoded, decimals };
     if (this.pumpSwapPoolCache.size > 2000) {
       this.pumpSwapPoolCache = new Map([...this.pumpSwapPoolCache].slice(-1000));
     }
@@ -832,7 +896,7 @@ export class SolanaWalletWatcher {
     if (this.seenSigs.has(sig)) return null;
     let poolInfo = null;
     try {
-      poolInfo = await this.resolvePumpSwapPool(trade.pool);
+      poolInfo = await this.resolvePumpSwapPool(trade.pool, ev);
     } catch {
       poolInfo = null;
     }
@@ -908,6 +972,11 @@ export class SolanaWalletWatcher {
   async fastTrade(w, ev, trade) {
     const sig = ev.signature;
     if (this.seenSigs.has(sig)) return null;
+    if (!trade.tokenProgram && ev?.tx?.transaction?.message?.accountKeys) {
+      const txKeys = ev.tx.transaction.message.accountKeys.map(keyOf);
+      if (txKeys.includes(TOKEN_2022_PROGRAM)) trade.tokenProgram = TOKEN_2022_PROGRAM;
+      else if (txKeys.includes(TOKEN_PROGRAM)) trade.tokenProgram = TOKEN_PROGRAM;
+    }
     let heldAfterRaw = null;
     if (!trade.isBuy) {
       if (typeof this.skipSellShare === 'function' && this.skipSellShare(w.address)) {
@@ -1017,7 +1086,7 @@ export class SolanaWalletWatcher {
     const prev = w.streamLamports;
     w.streamLamports = ev.lamports;
     if (prev == null) return; // first value is the baseline
-    if (Math.abs(ev.lamports - prev) / LAMPORTS_PER_SOL < 0.005) return; // dust / fee noise
+    if (Math.abs(ev.lamports - prev) / LAMPORTS_PER_SOL < SOL_DUST) return; // dust / fee noise
     this.streamStats.balanceMoves = (this.streamStats.balanceMoves || 0) + 1;
     this.fastCheck(w, ev.receivedAt || Date.now(), 0, Number.isFinite(ev.slot) ? ev.slot : null);
   }
@@ -1288,6 +1357,7 @@ export class SolanaWalletWatcher {
     if (this.seenSigs.has(sig)) return null;
     this.seenSigs.add(sig);
     if (this.seenSigs.size > 5000) this.seenSigs = new Set([...this.seenSigs].slice(-2500));
+    if (knownSwap?.signature) sig = knownSwap.signature;
 
     const fast = Boolean(waitForTx || via === 'stream' || via === 'token-stream');
     let tx = knownSwap ? null : knownTx || (await this.getTransaction(sig, { fast }));
@@ -1297,8 +1367,94 @@ export class SolanaWalletWatcher {
       await new Promise((r) => setTimeout(r, 35 + i * 20));
       tx = await this.getTransaction(sig, { fast });
     }
+    if (!knownSwap && !tx) {
+      // Not indexed on the RPC yet: remove from seenSigs so the backup poller / token stream can pick it up when indexed
+      this.seenSigs.delete(sig);
+    }
+    if (!knownSwap && tx && w.mode === 'balances') {
+      const keys = tx.transaction?.message?.accountKeys || [];
+      const hasSignerInfo = keys.some((k) => k && typeof k === 'object' && 'signer' in k);
+      if (hasSignerInfo && !keys.some((k) => k && typeof k === 'object' && k.pubkey === w.address && k.signer)) {
+        this.spamSigs.add(sig);
+        return null;
+      }
+    }
     this.status.txParsed += 1;
-    const swap = knownSwap || parseSwapFromTransaction(tx, w.address);
+    let swap = knownSwap || parseSwapFromTransaction(tx, w.address);
+    if (swap?.tokenToToken && this.allowTokenToToken) {
+      const t2t = swap.tokenToToken;
+      const [soldInfo, boughtInfo, solPx] = await Promise.all([
+        this.tokenInfo.get(t2t.soldMint).catch(() => null),
+        this.tokenInfo.get(t2t.boughtMint).catch(() => null),
+        typeof this.tokenInfo.solPriceFast === 'function' ? this.tokenInfo.solPriceFast() : this.tokenInfo.solPriceUsd(),
+      ]);
+      const solPriceUsd = Number(solPx) || 150;
+      const soldUsd = soldInfo?.priceUsd ? t2t.soldAmount * Number(soldInfo.priceUsd) : null;
+      const boughtUsd = boughtInfo?.priceUsd ? t2t.boughtAmount * Number(boughtInfo.priceUsd) : null;
+      const estUsd = boughtUsd || soldUsd || null;
+      const estSol = estUsd && solPriceUsd > 0 ? estUsd / solPriceUsd : null;
+      const holdingSold = typeof this.holdsToken === 'function' && this.holdsToken(w.address, t2t.soldMint);
+      if (holdingSold && estSol > 0) {
+        const sellSwap = {
+          side: 'sell',
+          sellSharePct: t2t.sellSharePct,
+          heldBefore: t2t.heldBefore,
+          tokenMint: t2t.soldMint,
+          tokenDecimals: t2t.soldDecimals,
+          tokenAmount: t2t.soldAmount,
+          quoteSymbol: 'SOL',
+          quoteMint: WSOL_MINT,
+          quoteAmount: estSol,
+          priceInQuote: estSol / t2t.soldAmount,
+          poolQuoteAmount: estSol,
+          signature: sig,
+          slot: t2t.slot,
+          blockTime: t2t.blockTime,
+          venue: t2t.venue,
+        };
+        // If we hold soldMint, emit the sell signal first; if boughtMint also has a price, emit the buy too
+        if (estSol > 0 && boughtInfo?.priceUsd) {
+          await this.processSignature(w, `${sig}:sell`, { backfill, via, receivedAt, knownSwap: sellSwap }).catch(() => null);
+          swap = {
+            side: 'buy',
+            sellSharePct: null,
+            heldBefore: t2t.boughtHeldBefore,
+            tokenMint: t2t.boughtMint,
+            tokenDecimals: t2t.boughtDecimals,
+            tokenAmount: t2t.boughtAmount,
+            quoteSymbol: 'SOL',
+            quoteMint: WSOL_MINT,
+            quoteAmount: estSol,
+            priceInQuote: estSol / t2t.boughtAmount,
+            poolQuoteAmount: estSol,
+            signature: sig,
+            slot: t2t.slot,
+            blockTime: t2t.blockTime,
+            venue: t2t.venue,
+          };
+        } else {
+          swap = sellSwap;
+        }
+      } else if (estSol > 0) {
+        swap = {
+          side: 'buy',
+          sellSharePct: null,
+          heldBefore: t2t.boughtHeldBefore,
+          tokenMint: t2t.boughtMint,
+          tokenDecimals: t2t.boughtDecimals,
+          tokenAmount: t2t.boughtAmount,
+          quoteSymbol: 'SOL',
+          quoteMint: WSOL_MINT,
+          quoteAmount: estSol,
+          priceInQuote: estSol / t2t.boughtAmount,
+          poolQuoteAmount: estSol,
+          signature: sig,
+          slot: t2t.slot,
+          blockTime: t2t.blockTime,
+          venue: t2t.venue,
+        };
+      }
+    }
     if (!swap || swap.skip) {
       const reason = swap?.skip || 'transaction not found';
       this.status.txSkipped += 1;
@@ -1313,9 +1469,9 @@ export class SolanaWalletWatcher {
     // on-chain price; the details are filled in when they arrive.
     // pump.fun coins are all alike: 1 billion supply, mint and freeze authority revoked. Their
     // details are not worth waiting for: market cap comes from the trader's own fill price.
-    const pumpCoin = isPumpFunCoin(swap) || swap.venue === 'launchlab' || (via === 'fast-logs' && Boolean(swap.curve));
+    const pumpCoin = isPumpFunCoin(swap) || swap.venue === 'launchlab' || swap.venue === 'pumpfun' || swap.venue === 'pumpswap' || (via === 'fast-logs' && Boolean(swap.curve));
     const liveStream = via === 'fast-logs' || via === 'stream' || via === 'token-stream';
-    const useFastInfoCache = !backfill && liveStream && (Boolean(swap.curve) || isPumpFunCoin(swap)) && this.tokenInfo?.cache instanceof Map;
+    const useFastInfoCache = !backfill && liveStream && (Boolean(swap.curve) || isPumpFunCoin(swap) || swap.venue === 'pumpswap' || swap.venue === 'pumpfun' || swap.venue === 'launchlab') && this.tokenInfo?.cache instanceof Map;
     const fastCachedHit = useFastInfoCache ? this.tokenInfo.cache.get(swap.tokenMint) : null;
     const budgetMs = pumpCoin ? Math.min(this.tokenInfoBudgetMs, this.pumpInfoBudgetMs) : this.tokenInfoBudgetMs;
     const infoPromise = this.tokenInfo.get(swap.tokenMint);
@@ -1574,6 +1730,7 @@ export class SolanaWalletWatcher {
     const sigs = (await this.rpc('getSignaturesForAddress', [w.address, opts])) || [];
     w.lastPollAt = Date.now();
     w.error = null;
+    const prevLastSig = w.lastSig;
     if (sigs.length) w.lastSig = sigs[0].signature;
     w.initialized = true;
 
@@ -1582,6 +1739,11 @@ export class SolanaWalletWatcher {
       w.mode = 'balances';
       w.floodedAt = Date.now();
       this.syncStreams();
+      if (!initial && prevLastSig) {
+        const bal = await this.getPaymentBalances(w.address).catch(() => ({ sol: null, usdc: null }));
+        w.flood = { sol: bal.sol, usdc: bal.usdc, seenSol: bal.sol, seenUsdc: bal.usdc, lastSig: sigs[0]?.signature || prevLastSig, misses: 0, at: Date.now() };
+        return this.scanOwnTransactions(w, prevLastSig, fast);
+      }
       return this.pollBalances(w, fast);
     }
 
@@ -1769,11 +1931,14 @@ export class SolanaWalletWatcher {
       w.floodCheckAt = Date.now();
       const probe = (await this.rpc('getSignaturesForAddress', [w.address, { limit: 100, commitment: 'confirmed' }])) || [];
       if (!isFlooded(probe, 100)) {
+        const prevSig = w.flood?.lastSig || w.lastSig || null;
         w.mode = 'history';
         w.floodedAt = null;
         w.flood = null;
-        if (probe.length) w.lastSig = probe[0].signature; // continue from now, no backfill
+        if (prevSig) w.lastSig = prevSig;
+        else if (probe.length) w.lastSig = probe[0].signature; // continue from now, no backfill
         this.syncStreams();
+        if (prevSig) return this.pollWallet(w, fast);
         return [];
       }
     }
@@ -1792,7 +1957,7 @@ export class SolanaWalletWatcher {
     // moved vs the last confirmed baseline, or vs the last value we saw (a buy then a sell can
     // bring SOL back to where it was)
     const d = (a, b) => (a != null && b != null ? Math.abs(a - b) : 0);
-    const moved = d(bal.sol, prev.sol) >= 0.005 || d(bal.sol, prev.seenSol) >= 0.005 || d(bal.usdc, prev.usdc) >= 0.5 || d(bal.usdc, prev.seenUsdc) >= 0.5;
+    const moved = d(bal.sol, prev.sol) >= SOL_DUST || d(bal.sol, prev.seenSol) >= SOL_DUST || d(bal.usdc, prev.usdc) >= 0.5 || d(bal.usdc, prev.seenUsdc) >= 0.5;
     if (!moved && !prev.misses) {
       w.flood = { ...prev, sol: bal.sol, usdc: bal.usdc ?? prev.usdc, seenSol: bal.sol, seenUsdc: bal.usdc, lastSig: newest || prev.lastSig };
       return [];
@@ -1800,7 +1965,8 @@ export class SolanaWalletWatcher {
     // The live feed watches this wallet: each move was already read from its own block, so the
     // slow full scan is only a backup for a move the feed did not report.
     if (moved && !prev.misses && this.balanceFeedLive(w)) {
-      const seenByFeed = (w.lastMoveAt || 0) >= (prev.at || 0);
+      const newestCovered = !newest || Boolean(head[0]?.err) || this.seenSigs.has(newest) || this.spamSigs.has(newest);
+      const seenByFeed = (w.lastMoveAt || 0) >= (prev.at || 0) && newestCovered;
       if (seenByFeed || !prev.waitedAt) {
         w.flood = seenByFeed
           ? { sol: bal.sol, usdc: bal.usdc ?? prev.usdc, seenSol: bal.sol, seenUsdc: bal.usdc, lastSig: newest || prev.lastSig, misses: 0, at: Date.now() }

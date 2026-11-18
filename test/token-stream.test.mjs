@@ -63,6 +63,15 @@ test('subscribes to both token programs filtered on the wallet, and reports buys
   assert.equal(changes[1].amount, 400n);
   assert.equal(changes[1].prevAmount, 1000n);
   assert.equal(changes[2].amount, 0n, 'closed account = sold everything');
+
+  // Incremental setWallets: adding a second wallet and removing the first keeps the same WebSocket connection open
+  const WALLET2 = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+  s.setWallets([WALLET, WALLET2]);
+  assert.equal(FakeWS.last, ws, 'same WebSocket kept open when adding a wallet');
+  assert.equal(ws.sent.filter((m) => m.method === 'programSubscribe').length, 4, 'only the new wallet subscribed');
+  s.setWallets([WALLET2]);
+  assert.equal(FakeWS.last, ws, 'same WebSocket kept open when removing a wallet');
+  assert.equal(ws.sent.filter((m) => m.method === 'programUnsubscribe').length, 2, 'removed wallet unsubscribed on both token programs');
   s.stop();
 });
 

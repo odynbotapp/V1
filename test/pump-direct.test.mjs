@@ -627,4 +627,113 @@ test('PD23 Turbo direct buy with Jito endpoint attaches atomic SystemProgram.tra
   assert.equal(tipIx.data.readBigUInt64LE(4), 812_500n, 'size-calibrated Jito tip for 0.325 SOL ($65 @ $200/SOL) buy');
   assert.ok(blastedUrls.includes('https://mainnet.helius-rpc.com/?api-key=test'), 'Helius URL unchanged');
   assert.ok(blastedUrls.includes('https://mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true'), 'Jito blasted with bundleOnly=true');
+  const cuPriceIx = ixs.find((ix) => ix.programId === PD.COMPUTE_BUDGET_PROGRAM && ix.data[0] === 3);
+  assert.ok(cuPriceIx, 'SetComputeUnitPrice instruction included');
+  assert.deepEqual(cuPriceIx.accounts, [PD.JITO_DONT_FRONT_ACCOUNT], 'jitodontfront anti-sandwich marker account attached to SetComputeUnitPrice');
 });
+
+test('PD24 Part 1 Infra: multi-relay variant fan-out (Jito + Nozomi + Astralane), non-idempotent Create ATA race guard, and RTT-sorted endpoint blasting', async () => {
+  const { jitoTipLamportsFor, priorityMicroLamportsFor } = await import('../engine/realTrader.mjs');
+  const { trader, w, token } = world();
+  trader.fastRpcUrls = [
+    'https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions',
+    'https://ams1.nozomi.temporal.xyz/?c=test',
+    'https://fr.gateway.astralane.io/iris?api-key=test',
+  ];
+  const pf = { mode: 'turbo', customSol: 0.002 };
+  trader.jitoTipLamports = (side, tradeSol) => jitoTipLamportsFor(pf, { side, tradeSol, hasJito: trader.hasJitoEndpoint() });
+  trader.priorityMicroLamports = (units, side, tradeSol) => priorityMicroLamportsFor(pf, units, null, { tradeSol, side, tipLamports: trader.jitoTipLamports(side, tradeSol) });
+
+  // 1. RTT measurement & sorting: Astralane (2ms) < Nozomi (5ms) < Jito NY (40ms)
+  let fakeNow = 10_000;
+  trader.now = () => fakeNow;
+  const blasts = [];
+  const origFetch = trader.fetch;
+  trader.fetch = async (url, opts) => {
+    const s = String(url);
+    if (opts?.method === 'OPTIONS') {
+      if (s.includes('astralane')) fakeNow += 2;
+      else if (s.includes('nozomi')) fakeNow += 5;
+      else if (s.includes('jito.wtf')) fakeNow += 40;
+      return { ok: true, status: 200 };
+    }
+    if (s.includes('jito.wtf') || s.includes('nozomi') || s.includes('astralane')) {
+      const body = JSON.parse(opts.body);
+      blasts.push({ url: s, txB64: body.params[0] });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'ok' }) };
+    }
+    return origFetch(url, opts);
+  };
+  await trader.warmConnections();
+  const sorted = trader.sortedFastRpcUrls();
+  assert.ok(sorted[0].includes('astralane'), `fastest RTT endpoint sorted first: ${sorted.join(' -> ')}`);
+  assert.ok(sorted[1].includes('nozomi'), `second fastest RTT endpoint sorted second: ${sorted.join(' -> ')}`);
+
+  // 2. Simulate Nozomi winning the race while Jito's copy fails on ATA Create guard
+  const origRpc = trader.rpc;
+  trader.rpc = async (method, params) => {
+    if (method === 'getSignatureStatuses') {
+      const sigs = params[0];
+      // First sig (Jito) fails with InstructionError on Create ATA (another variant won), second sig (Nozomi) succeeds!
+      if (sigs.length > 1) {
+        return {
+          value: sigs.map((s, idx) =>
+            idx === 1
+              ? { confirmationStatus: 'confirmed', err: null }
+              : { confirmationStatus: 'confirmed', err: { InstructionError: [2, { Custom: 0 }] } }
+          ),
+        };
+      }
+    }
+    return origRpc(method, params);
+  };
+
+  const q = await trader.quote({ side: 'buy', token, amountUsd: 65, slippagePct: 15 });
+  const r = await trader.execute({ side: 'buy', token, amountUsd: 65, quote: q, slippagePct: 15, newTokenAccount: true });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(blasts.length, 3, 'blasted to all 3 relays in RTT order');
+  assert.ok(blasts[0].url.includes('astralane'), 'Astralane fired first');
+  assert.ok(blasts[1].url.includes('nozomi'), 'Nozomi fired second');
+  assert.ok(blasts[2].url.includes('jito.wtf') && blasts[2].url.includes('bundleOnly=true'), 'Jito fired third with bundleOnly=true');
+
+  // Decode each relay's transaction to verify non-idempotent Create ATA guard + provider-specific tip account
+  const decodeTxIxs = (b64) => {
+    const tx = Buffer.from(b64, 'base64');
+    const n = tx[0];
+    const m = tx.subarray(1 + 64 * n);
+    const nKeys = m[3];
+    const keys = Array.from({ length: nKeys }, (_, i) => base58Encode(m.subarray(4 + 32 * i, 36 + 32 * i)));
+    let o = 4 + 32 * nKeys + 32;
+    const nIx = m[o++];
+    const out = [];
+    for (let i = 0; i < nIx; i++) {
+      const programId = keys[m[o++]];
+      const na = m[o++];
+      const accounts = Array.from({ length: na }, (_, j) => keys[m[o + j]]);
+      o += na;
+      const dl = m[o++];
+      const data = Buffer.from(m.subarray(o, o + dl));
+      o += dl;
+      out.push({ programId, accounts, data });
+    }
+    return out;
+  };
+
+  const astraIxs = decodeTxIxs(blasts[0].txB64);
+  const nozomiIxs = decodeTxIxs(blasts[1].txB64);
+  const jitoIxs = decodeTxIxs(blasts[2].txB64);
+
+  for (const [label, list] of [['astralane', astraIxs], ['nozomi', nozomiIxs], ['jito', jitoIxs]]) {
+    const ataIx = list.find((ix) => ix.programId === PD.ATA_PROGRAM);
+    assert.ok(ataIx, `${label}: includes ATA instruction`);
+    assert.deepEqual([...ataIx.data], [0], `${label}: uses non-idempotent Create (0) as native on-chain race guard`);
+  }
+
+  const astraTip = astraIxs.find((ix) => ix.programId === PD.SYSTEM_PROGRAM && ix.data.length === 12);
+  const nozomiTip = nozomiIxs.find((ix) => ix.programId === PD.SYSTEM_PROGRAM && ix.data.length === 12);
+  const jitoTip = jitoIxs.find((ix) => ix.programId === PD.SYSTEM_PROGRAM && ix.data.length === 12);
+  assert.ok(PD.ASTRALANE_TIP_ACCOUNTS.includes(astraTip.accounts[1]), 'Astralane variant tips Astralane tip account');
+  assert.ok(PD.NOZOMI_TIP_ACCOUNTS.includes(nozomiTip.accounts[1]), 'Nozomi variant tips Nozomi tip account');
+  assert.ok(PD.JITO_TIP_ACCOUNTS.includes(jitoTip.accounts[1]), 'Jito variant tips Jito tip account');
+});
+

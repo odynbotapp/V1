@@ -496,3 +496,72 @@ test('L-speed2: no dry-run preview (and no extra quote) when a copy runs; the fe
   assert.equal(dry, 1, 'dry-run preview when nothing is copied');
   assert.ok(ctx.live.signals.find((s) => s.signature === 'd2').decisions.length);
 });
+
+test('L-never-miss: <$1 crashed sell, Jito-tipped sell (negative net wallet SOL), and token-to-token swap are all caught and mirrored', async () => {
+  const { parseSwapFromTransaction, PUMP_CURVE_PROGRAM } = await import('../engine/walletWatcher.mjs');
+  const { bondingCurvePda } = await import('../engine/pumpCurve.mjs');
+  const curve = bondingCurvePda(MEME);
+
+  // 1. Trader sells for 0.002 SOL ($0.40) from the curve but pays a 0.004 SOL Jito tip (net wallet SOL change = -0.002 SOL)
+  const tok = { accountIndex: 2, mint: MEME, owner: WALLET, uiTokenAmount: { amount: '1000000000000', decimals: 6 } };
+  const zero = { ...tok, uiTokenAmount: { amount: '0', decimals: 6 } };
+  const jitoSellTx = {
+    slot: 10,
+    blockTime: Math.floor(Date.now() / 1000),
+    meta: {
+      err: null,
+      fee: 5000,
+      preBalances: [5e9, 30e9, 0, 1, 0],
+      postBalances: [5e9 - 0.002e9 - 5000, 30e9 - 0.002e9, 0, 1, 0.004e9],
+      preTokenBalances: [tok],
+      postTokenBalances: [zero],
+    },
+    transaction: {
+      signatures: ['jito-sell-1'],
+      message: {
+        accountKeys: [
+          { pubkey: WALLET, signer: true },
+          { pubkey: curve, signer: false },
+          { pubkey: 'Acc1111111111111111111111111111111111111111', signer: false },
+          { pubkey: PUMP_CURVE_PROGRAM, signer: false },
+          { pubkey: 'Tip11111111111111111111111111111111111111111', signer: false },
+        ],
+      },
+    },
+  };
+  const parsedSell = parseSwapFromTransaction(jitoSellTx, WALLET);
+  assert.equal(parsedSell.skip, undefined);
+  assert.equal(parsedSell.side, 'sell');
+  assert.ok(Math.abs(parsedSell.quoteAmount - 0.002) < 1e-9);
+
+  // 2. <$1 crashed sell is NOT dropped by handleSignalNow dust filter and closes our Mirror position
+  const ctx = setup();
+  ctx.follow.mode = 'mirror';
+  await ctx.watcher.pollOnce();
+  ctx.swap('buy-before-crash', WALLET, 'buy');
+  await ctx.watcher.pollOnce();
+  assert.equal(ctx.engine.positions.filter((p) => p.remainingTokens > 0).length, 1);
+
+  await ctx.live.handleSignal({
+    id: 'sig-crashed-sell',
+    chainId: 'solana',
+    wallet: WALLET,
+    label: '@whale1',
+    side: 'sell',
+    tokenMint: MEME,
+    tokenDecimals: 6,
+    symbol: 'MEME',
+    tokenAmount: 1_000_000,
+    sellSharePct: 100,
+    quoteSymbol: 'SOL',
+    quoteAmount: 0.002,
+    usdValue: 0.4, // < $1 crashed sell!
+    txPriceUsd: 0.0000004,
+    currentPriceUsd: 0.0000004,
+    signature: 'crashed-sell-sig',
+    blockTime: Date.now(),
+    detectedAt: Date.now(),
+    backfill: false,
+  });
+  assert.equal(ctx.engine.positions[0].remainingTokens, 0, '<$1 crashed trader sell still closes our Mirror position');
+});

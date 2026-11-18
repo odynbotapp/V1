@@ -1150,3 +1150,258 @@ test('S22 Nov 11 4-edit calibration: smart maxChase (30% <=$12k MC, 26.5% >$12k 
   assert.equal(buyWithJito, 3_684_211);
   assert.equal(sellWithJito, 38_461_538);
 });
+
+test('S23 Audit High & Medium fixes: ownWalletAddress gRPC cache, in-flight buy vs immediate trader sell race, v1 getTransactionParsed, and optional sell Jito tip', async () => {
+  const { jitoTipLamportsFor } = await import('../engine/realTrader.mjs');
+
+  // 1. Optional sell Jito tip via envSellTipLamports (while default remains 0)
+  assert.equal(jitoTipLamportsFor({ mode: 'turbo' }, { side: 'sell', hasJito: true }), 0);
+  assert.equal(jitoTipLamportsFor({ mode: 'turbo' }, { side: 'sell', hasJito: true, envSellTipLamports: '150000' }), 150_000);
+
+  // 2. ownWalletAddress subscribes bot wallet on grpcFeed and calls onWalletTx without emitting a trader signal
+  const BOT_WALLET = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+  const signals = [];
+  const cachedOwnTxs = [];
+  const w = new SolanaWalletWatcher({
+    fetchImpl: async () => new Response('{}'),
+    grpcUrl: 'http://example.invalid:10201?api-key=k',
+    onSignal: (s) => signals.push(s),
+  });
+  w.ownWalletAddress = BOT_WALLET;
+  w.onWalletTx = (addr, ev) => cachedOwnTxs.push({ addr, sig: ev.signature });
+  w.setWallets([{ address: WALLET, label: 'decu' }]);
+  assert.ok(w.grpcFeed.wallets.has(WALLET), 'followed trader subscribed on gRPC');
+  assert.ok(w.grpcFeed.wallets.has(BOT_WALLET), 'bot ownWalletAddress subscribed on gRPC');
+  w.handleStreamLogs(BOT_WALLET, { signature: 'own-bot-swap', err: null, tx: { meta: { err: null } }, logs: [] }, 'grpc');
+  assert.equal(cachedOwnTxs.length, 1);
+  assert.equal(cachedOwnTxs[0].sig, 'own-bot-swap');
+  assert.equal(signals.length, 0, 'bot own swap never becomes a trader signal');
+
+  // 3. In-flight buy vs immediate trader sell race: sell waits for in-flight buy to book and immediately closes the position
+  const e = new CopyTradingEngine();
+  e.resetToCleanState();
+  e.settings.paperTrading = true;
+  let releaseBuy;
+  const buyGate = new Promise((r) => {
+    releaseBuy = r;
+  });
+  const origExec = e.adapter.executeSwap.bind(e.adapter);
+  e.adapter.executeSwap = async (args) => {
+    if (args.side === 'buy') await buyGate;
+    return origExec(args);
+  };
+  const f = {
+    id: 'fol-race',
+    walletId: e.getActiveWallet().id,
+    name: 'FastTrader',
+    handle: 'FastTrader',
+    traderWallet: WALLET,
+    chainId: 'solana',
+    status: 'copying',
+    pauseReason: null,
+    mode: 'auto-exit',
+    mirrorSells: true,
+    sizing: { type: 'fixed', amount: 25 },
+    minTradeUsd: 1,
+    maxOpenPositions: 10,
+    maxAtRiskUsd: 1000,
+    consecutiveLosses: 0,
+    exitRules: createDefaultExitRules(),
+    filtersOverride: {},
+    createdAt: Date.now(),
+  };
+  e.follows.push(f);
+  const MINT = 'RaceMint1111111111111111111111111111111pump';
+  const buyP = e.processTraderSignal({
+    chainId: 'solana',
+    side: 'buy',
+    traderHandle: f.handle,
+    traderWallet: WALLET,
+    traderBuyUsd: 100,
+    signature: 'sig-race-buy',
+    token: { address: MINT, symbol: 'RACE', isLaunchpad: true, traderFillPriceUsd: 0.00001, currentPriceUsd: 0.00001, safety: { safetyVerified: true } },
+  });
+  // Trader sells 10ms later while our buy is still in-flight!
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(e.positions.length, 0, 'buy is still in flight, position not booked yet');
+  const sellP = e.processTraderSignal({
+    chainId: 'solana',
+    side: 'sell',
+    sellSharePct: 100,
+    traderHandle: f.handle,
+    traderWallet: WALLET,
+    signature: 'sig-race-sell',
+    token: { address: MINT, symbol: 'RACE', traderFillPriceUsd: 0.000011, currentPriceUsd: 0.000011 },
+  });
+  setTimeout(() => releaseBuy(), 20);
+  const [[buyRes], [sellRes]] = await Promise.all([buyP, sellP]);
+  assert.equal(buyRes.status, 'filled');
+  assert.equal(sellRes.ok, true, 'sell waited for in-flight buy and closed the position instead of skipping');
+  assert.equal(e.positions[0].remainingTokens, 0, 'position closed immediately after in-flight buy finished');
+
+  // 4. RealTrader.getTransactionParsed requests maxSupportedTransactionVersion: 1 and falls back to 0
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const secret = base58Encode(Buffer.concat([privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32), publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)]));
+  const requestedVersions = [];
+  const trader = new RealTrader({
+    env: { ODEX_TRADER_KEY: secret },
+    solPrice: () => 200,
+    rpc: async (method, params) => {
+      if (method === 'getTransaction') {
+        requestedVersions.push(params[1]?.maxSupportedTransactionVersion);
+        return { slot: 1, meta: { err: null } };
+      }
+      return null;
+    },
+  });
+  const parsedTx = await trader.getTransactionParsed('sig-v1');
+  assert.equal(parsedTx?.slot, 1);
+  assert.equal(requestedVersions[0], 1, 'requested maxSupportedTransactionVersion: 1');
+});
+
+test('S24 Decu multi-buy 1+ SOL pattern: copies multiple 1+ SOL buys, ignores <1 SOL MC pop-up buys, and sells all positions on exit', async () => {
+  const { restoreEngine } = await import('../engine/persistence.mjs');
+  const e = new CopyTradingEngine();
+  e.resetToCleanState();
+  e.settings.paperTrading = true;
+  e.settings.cooldown.enabled = true; // default 10 min cooldown ON
+  restoreEngine(e, {
+    follows: [{
+      id: 'fol-03782071',
+      walletId: e.getActiveWallet().id,
+      name: '4vw5…9Ud9',
+      handle: '4vw5…9Ud9',
+      traderWallet: '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9',
+      chainId: 'solana',
+      status: 'copying',
+      mode: 'auto-exit',
+      mirrorSells: true,
+      sizing: { type: 'fixed', amount: 25 },
+      minTradeUsd: 1,
+      maxOpenPositions: 10,
+      maxAtRiskUsd: 1000,
+    }],
+  });
+
+  const f = e.follows[0];
+  assert.equal(f.copyTopUps, true, 'Decu copies multiple 1+ SOL buys');
+  assert.equal(f.filtersOverride.minTraderBuyNative, 1, 'Decu only copies 1+ SOL buys');
+
+  const ttMint = '8cxW5E1111111111111111111111111111111119nsx';
+  // 1. Decu buys 2.970 SOL of $TT -> copied
+  const [buy1] = await e.processTraderSignal({
+    chainId: 'solana', side: 'buy', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 224.15, traderBuyNative: 2.97, traderHeldBefore: 0, traderTokens: 35_000_000,
+    token: { address: ttMint, symbol: 'TT', isLaunchpad: true, marketCapUsd: 6300, traderFillPriceUsd: 0.00000633, currentPriceUsd: 0.00000633, safety: { safetyVerified: true } },
+  });
+  assert.equal(buy1.status, 'filled');
+
+  // 2. Decu buys 0.247 SOL twice to pop up MC -> both skipped by 1+ SOL filter
+  for (const mc of [7100, 11100]) {
+    const [bump] = await e.processTraderSignal({
+      chainId: 'solana', side: 'buy', traderHandle: f.handle, traderWallet: f.traderWallet,
+      traderBuyUsd: 18.68, traderBuyNative: 0.247, traderHeldBefore: 35_000_000, traderTokens: 2_500_000,
+      token: { address: ttMint, symbol: 'TT', isLaunchpad: true, marketCapUsd: mc, traderFillPriceUsd: 0.00000705, currentPriceUsd: 0.00000705, safety: { safetyVerified: true } },
+    });
+    assert.equal(bump.status, 'skipped');
+    assert.match(bump.reason, /buy size outside your filter/);
+  }
+
+  // 3. Decu buys another 1.50 SOL of $TT -> copied despite active 10m cooldown
+  const [buy2] = await e.processTraderSignal({
+    chainId: 'solana', side: 'buy', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 115, traderBuyNative: 1.5, traderHeldBefore: 40_000_000, traderTokens: 15_000_000,
+    token: { address: ttMint, symbol: 'TT', isLaunchpad: true, marketCapUsd: 9500, traderFillPriceUsd: 0.0000075, currentPriceUsd: 0.0000075, safety: { safetyVerified: true } },
+  });
+  assert.equal(buy2.status, 'filled');
+  assert.equal(e.positions.filter((p) => p.tokenAddress === ttMint && p.remainingTokens > 0).length, 2, 'both 1+ SOL buys opened positions');
+
+  // 4. Decu sells $TT -> both positions are closed
+  await e.processTraderSignal({
+    chainId: 'solana', side: 'sell', sellSharePct: 100, traderHandle: f.handle, traderWallet: f.traderWallet,
+    token: { address: ttMint, symbol: 'TT', traderFillPriceUsd: 0.00000785, currentPriceUsd: 0.00000785 },
+  });
+  assert.equal(e.positions.filter((p) => p.tokenAddress === ttMint && p.remainingTokens > 0).length, 0, 'all open positions for $TT closed on trader exit');
+
+  // 5. If Decu does a small 0.247 SOL warmup buy FIRST and then a 2.5 SOL real buy, the 2.5 SOL buy is copied
+  const chikaMint = 'DefREL111111111111111111111111111111111pump';
+  const [warmup] = await e.processTraderSignal({
+    chainId: 'solana', side: 'buy', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 18.68, traderBuyNative: 0.247, traderHeldBefore: 0, traderTokens: 3_000_000,
+    token: { address: chikaMint, symbol: 'Chika', isLaunchpad: true, marketCapUsd: 6000, traderFillPriceUsd: 0.000006, currentPriceUsd: 0.000006, safety: { safetyVerified: true } },
+  });
+  assert.equal(warmup.status, 'skipped');
+  const [realEntry] = await e.processTraderSignal({
+    chainId: 'solana', side: 'buy', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 190, traderBuyNative: 2.5, traderHeldBefore: 3_000_000, traderTokens: 28_000_000,
+    token: { address: chikaMint, symbol: 'Chika', isLaunchpad: true, marketCapUsd: 7500, traderFillPriceUsd: 0.0000068, currentPriceUsd: 0.0000068, safety: { safetyVerified: true } },
+  });
+  assert.equal(realEntry.status, 'filled', '1+ SOL buy after <1 SOL warmup buy is copied');
+
+  // 6. Back-to-back distinct 1+ SOL buys arriving while the 1st buy is still in-flight both fill sequentially
+  const b2bMint = 'B2BMint11111111111111111111111111111111pump';
+  const origExec = e.adapter.executeSwap.bind(e.adapter);
+  let releaseFirstBuy;
+  let b2bCalls = 0;
+  e.adapter.executeSwap = async (args) => {
+    if (args.side === 'buy' && args.token?.address === b2bMint && ++b2bCalls === 1) {
+      await new Promise((r) => {
+        releaseFirstBuy = r;
+      });
+    }
+    return origExec(args);
+  };
+  const b2bP1 = e.processTraderSignal({
+    chainId: 'solana', side: 'buy', signature: 'sig-b2b-1', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 150, traderBuyNative: 2.0, traderHeldBefore: 0, traderTokens: 20_000_000,
+    token: { address: b2bMint, symbol: 'B2B', isLaunchpad: true, marketCapUsd: 6500, traderFillPriceUsd: 0.0000065, currentPriceUsd: 0.0000065, safety: { safetyVerified: true } },
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const b2bP2 = e.processTraderSignal({
+    chainId: 'solana', side: 'buy', signature: 'sig-b2b-2', traderHandle: f.handle, traderWallet: f.traderWallet,
+    traderBuyUsd: 150, traderBuyNative: 2.0, traderHeldBefore: 20_000_000, traderTokens: 18_000_000,
+    token: { address: b2bMint, symbol: 'B2B', isLaunchpad: true, marketCapUsd: 7800, traderFillPriceUsd: 0.0000078, currentPriceUsd: 0.0000078, safety: { safetyVerified: true } },
+  });
+  setTimeout(() => releaseFirstBuy(), 15);
+  const [[resB2b1], [resB2b2]] = await Promise.all([b2bP1, b2bP2]);
+  e.adapter.executeSwap = origExec;
+  assert.equal(resB2b1.status, 'filled');
+  assert.equal(resB2b2.status, 'filled', 'second distinct 1+ SOL buy waited for first in-flight buy and filled');
+
+  // 7. RealTrader.directQuote preserves preTokens = cachedMeta.heldRaw on a 2nd fastCurve buy
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const secret = base58Encode(Buffer.concat([privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32), publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)]));
+  const trader = new RealTrader({
+    env: { ODEX_TRADER_KEY: secret },
+    solPrice: () => 200,
+    routeSetting: () => 'direct',
+    rpc: async (method) => {
+      if (method === 'getLatestBlockhash') return { value: { blockhash: '11111111111111111111111111111111' } };
+      return null;
+    },
+  });
+  trader.balance = { sol: 5, usdc: 0, at: Date.now() };
+  trader.mintMetaCache = new Map([[ttMint, { tokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', heldRaw: 12_345_678_000n, estimated: false }]]);
+  const dq2 = await trader.directQuote({
+    side: 'buy',
+    amountUsd: 50,
+    slippagePct: 15,
+    px: 200,
+    token: {
+      address: ttMint,
+      decimals: 6,
+      currentPriceUsd: 0.00001,
+      curve: {
+        virtualSolReserves: 35_000_000_000,
+        virtualTokenReserves: 900_000_000_000_000,
+        realTokenReserves: 600_000_000_000_000,
+        tokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        at: Date.now(),
+      },
+    },
+  });
+  assert.equal(dq2?._direct?.fastCurve, true);
+  assert.equal(dq2?._direct?.preTokens, 12_345_678_000n, '2nd fastCurve buy preserves existing heldRaw as preTokens');
+  assert.equal(dq2?._direct?.ataExists, true);
+});
+
