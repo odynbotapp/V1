@@ -889,6 +889,10 @@ export class CopyTradingEngine {
     // Pre-cap slippage before the first quote when the known market/curve price has already moved
     // above the trader's fill price, avoiding a second round-trip quote to Jupiter.
     const maxChasePre = this.maxChaseFor(follow, token);
+    if (real && follow.chainId === 'solana' && maxChasePre > 30 && maxChasePre < 1000) {
+      const chaseRoomCap = Math.min(45, Math.floor((1 - 1 / (1 + maxChasePre / 100)) * 1000) / 10);
+      if (chaseRoomCap > buySlippagePct) buySlippagePct = chaseRoomCap;
+    }
     if (real && follow.chainId === 'solana' && Number(token.traderFillPriceUsd) > 0 && maxChasePre < 1000 && Number(token.curve?.virtualSolReserves) > 0 && Number(token.curve?.virtualTokenReserves) > 0) {
       const solPxPre = Number(CHAINS.solana?.nativePriceUsd) || 0;
       const vSolPre = Number(token.curve.virtualSolReserves) / 1e9;

@@ -1102,15 +1102,16 @@ test('S22 Nov 11 4-edit calibration: smart maxChase (30% <=$12k MC, 26.5% >$12k 
   });
 
   const f = e.follows[0];
-  assert.equal(f.maxChasePct, 30);
+  assert.equal(f.maxChasePct, 65);
   assert.equal(f.matureMaxChasePct, 26.5);
+  assert.equal(f.freshMcMaxUsd, 15000);
   assert.equal(f.exitRules.moonbagTrail.armsAtPct, 22);
   assert.equal(f.exitRules.floor.graceSec, 4);
   assert.equal(f.filtersOverride.maxMarketCapUsd, 100000);
 
-  // Edit #1: Qi ($9.1k MC <= $12k) allows 27.56% chase (<= 30%), while GIF ($13.9k MC > $12k) caps at 26.5%
-  assert.equal(e.maxChaseFor(f, { marketCapUsd: 9100 }), 30);
-  assert.equal(e.maxChaseFor(f, { marketCapUsd: 13900 }), 26.5);
+  // Fresh micro-cap (<= $15k MC) allows 65% chase so 3 SOL curve jumps don't 6042, while > $15k MC caps at 26.5%
+  assert.equal(e.maxChaseFor(f, { marketCapUsd: 9100 }), 65);
+  assert.equal(e.maxChaseFor(f, { marketCapUsd: 16900 }), 26.5);
 
   // Edit #4: updog ($780.3k MC > $100k limit) is skipped by market cap filter
   const [updogRes] = await e.processTraderSignal({
@@ -1404,4 +1405,51 @@ test('S24 Decu multi-buy 1+ SOL pattern: copies multiple 1+ SOL buys, ignores <1
   assert.equal(dq2?._direct?.preTokens, 12_345_678_000n, '2nd fastCurve buy preserves existing heldRaw as preTokens');
   assert.equal(dq2?._direct?.ataExists, true);
 });
+
+test('S25 token-paired curves (solPaired: false) skip 1-hop RPC in directQuote, compute live metrics, and expand fresh micro-cap buySlippagePct up to 65% chase ceiling', async () => {
+  const { parseBondingCurve, tokenPairedCurveMetrics } = await import('../engine/pumpCurve.mjs');
+  const { base58Decode } = await import('../engine/onchainMeta.mjs');
+
+  // 1. DirectQuote returns null in 0 RPC calls when token.curve.solPaired === false
+  let rpcCount = 0;
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const secret = base58Encode(Buffer.concat([privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32), publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)]));
+  const trader = new RealTrader({
+    env: { ODEX_TRADER_KEY: secret },
+    solPrice: () => 200,
+    routeSetting: () => 'direct',
+    rpc: async () => {
+      rpcCount += 1;
+      return null;
+    },
+  });
+  const dqNonSol = await trader.directQuote({
+    side: 'buy',
+    amountUsd: 15,
+    slippagePct: 15,
+    px: 200,
+    token: {
+      address: 'GeY5CYu84EsXn7gTiaXB1H1ku5wvjiSqAM2jtxGFpump',
+      decimals: 6,
+      curve: { solPaired: false, tokenProgram: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' },
+    },
+  });
+  assert.equal(dqNonSol, null, 'directQuote returns null for token-paired curve');
+  assert.equal(rpcCount, 0, 'zero RPC calls when curve.solPaired === false');
+
+  // 2. tokenPairedCurveMetrics computes live USD price, MC, and liquidity from non-SOL quoteMint reserves
+  const buf = Buffer.alloc(166);
+  buf.writeBigUInt64LE(1_000_000_000_000_000n, 8); // 1B virtual tokens
+  buf.writeBigUInt64LE(275_000_000_000n, 16); // 275k virtual quote tokens (6 dec)
+  buf.writeBigUInt64LE(700_000_000_000_000n, 24);
+  buf.writeBigUInt64LE(10_000_000_000n, 32); // 10k real quote tokens
+  buf.writeBigUInt64LE(1_000_000_000_000_000n, 40); // 1B total supply
+  Buffer.from(base58Decode('9hjBLBrc7WZW2H8UQvBAvG5WiTZotXUv2Bdcn4f4pump')).copy(buf, 83);
+  const parsed = parseBondingCurve(buf);
+  assert.equal(parsed.solPaired, false);
+  const metrics = tokenPairedCurveMetrics(parsed, 0.0136, 6);
+  assert.ok(metrics.priceUsd > 0.0000037 && metrics.priceUsd < 0.0000038);
+  assert.equal(metrics.curve.virtualSolReserves, 0, 'keeps virtualSolReserves=0 so 1-hop SOL math is never used');
+});
+
 

@@ -267,9 +267,10 @@ export function parseSwapFromTransaction(tx, wallet) {
   }
 
   // price from the pool leg (excludes fees, tips and deposits); SOL-quoted trades only
+  const llSolValid = quote.symbol === 'SOL' && llSol > 0 && llSol >= quote.amount * 0.7 && llSol <= quote.amount * 1.05 + 1e-9;
   const poolQuote =
     quote.symbol === 'SOL'
-      ? llSol > 0 && llSol <= quote.amount * 1.05 + 1e-9
+      ? llSolValid
         ? llSol
         : poolSolLeg(tx, wallet, { side, mint: tok.mint, venue: swapVenue, walletSol: quote.amount })
       : null;
@@ -295,7 +296,7 @@ export function parseSwapFromTransaction(tx, wallet) {
     // where it traded: decided from the programs in the transaction, not from a data feed
     venue: swapVenue,
     curve:
-      llEv && llEv.virtualSolReserves > 0 && llEv.virtualTokenReserves > 0
+      llSolValid && llEv && llEv.virtualSolReserves > 0 && llEv.virtualTokenReserves > 0
         ? {
             virtualSolReserves: llEv.virtualSolReserves,
             virtualTokenReserves: llEv.virtualTokenReserves,
@@ -314,7 +315,13 @@ export function parseSwapFromTransaction(tx, wallet) {
               tokenProgram: pumpEv.tokenProgram || txTokenProg,
               at: Date.now(),
             }
-          : undefined,
+          : pumpLogRes?.skip === 'coin not priced in SOL'
+            ? {
+                solPaired: false,
+                tokenProgram: txTokenProg,
+                at: Date.now(),
+              }
+            : undefined,
   };
 }
 
@@ -798,6 +805,7 @@ export class SolanaWalletWatcher {
     this.streamStats.swapsSeen += 1;
     const hasPumpCurveLog = Array.isArray(ev.logs) && ev.logs.some((l) => String(l).includes(PUMP_CURVE_PROGRAM) || String(l).includes(RAYDIUM_LAUNCHLAB_PROGRAM));
     const hasPumpSwapLog = Array.isArray(ev.logs) && ev.logs.some((l) => String(l).includes(PUMP_AMM_PROGRAM));
+    let nonSolCurveTrade = false;
     if (this.fastDetect() && hasPumpCurveLog) {
       const r = pumpTradeFromLogs(ev.logs, address, { err: ev.err });
       if (r.trade) {
@@ -807,10 +815,7 @@ export class SolanaWalletWatcher {
       if (r.forged) this.fastStats.forged += 1;
       this.fastStats.misses += 1;
       this.fastStats.missReasons[r.skip] = (this.fastStats.missReasons[r.skip] || 0) + 1;
-      if (r.nonSolBuy) {
-        this.seenSigs.add(ev.signature);
-        return;
-      }
+      if (r.skip === 'coin not priced in SOL') nonSolCurveTrade = true;
     }
     if (this.fastDetect() && ev.tx) {
       const keys = ev.tx.transaction?.message?.accountKeys || [];
@@ -829,7 +834,7 @@ export class SolanaWalletWatcher {
         return;
       }
     }
-    if (this.fastDetect() && hasPumpSwapLog) {
+    if (this.fastDetect() && hasPumpSwapLog && !nonSolCurveTrade) {
       const ps = pumpSwapTradeFromLogs(ev.logs, address, { err: ev.err });
       if (ps.trade) {
         this.fastPumpSwapTrade(w, ev, ps.trade);
@@ -914,11 +919,8 @@ export class SolanaWalletWatcher {
         this.fastStats.misses += 1;
         this.fastStats.missReasons[swap.skip] = (this.fastStats.missReasons[swap.skip] || 0) + 1;
       }
-      if (swap?.nonSolBuy) this.seenSigs.add(sig);
-      else if (!swap?.skip) {
-        this.streamQueue.push({ w, ev });
-        this.drainStream();
-      }
+      this.streamQueue.push({ w, ev });
+      this.drainStream();
       return null;
     }
     this.fastStats.hits += 1;
@@ -1895,7 +1897,7 @@ export class SolanaWalletWatcher {
     let block = null;
     for (let attempt = 0; attempt < 10 && this.running; attempt++) {
       try {
-        block = await this.rpc('getBlock', [slot, { encoding: 'json', transactionDetails: 'accounts', maxSupportedTransactionVersion: 0, rewards: false, commitment: 'confirmed' }], { fast: true });
+        block = await this.rpc('getBlock', [slot, { encoding: 'json', transactionDetails: 'accounts', maxSupportedTransactionVersion: 1, rewards: false, commitment: 'confirmed' }], { fast: true });
         if (block) break;
         if (attempt >= 1) return null; // an empty answer (not 'not available yet'): this RPC can't serve it
       } catch (err) {

@@ -975,6 +975,15 @@ export class RealTrader {
         : cachedMeta && cachedMeta.heldRaw > 0n && !cachedMeta.estimated && !activeBuying && (token.curve.tokenProgram === PD.TOKEN_PROGRAM || token.curve.tokenProgram === PD.TOKEN_2022_PROGRAM || cachedMeta.tokenProgram))
         ? token.curve
         : null;
+    if (token?.curve?.solPaired === false) {
+      const tokDecFast = Number.isInteger(token?.decimals) ? token.decimals : this.decimals.get(mint) ?? 6;
+      this.decimals.set(mint, tokDecFast);
+      if (token.curve.tokenProgram && !cachedMeta?.tokenProgram) {
+        this.mintMetaCache.set(mint, { ...(cachedMeta || {}), tokenProgram: token.curve.tokenProgram });
+      }
+      this.noteFallback('curve is not priced in SOL');
+      return null;
+    }
     let curve;
     let baseTokenProgram;
     let userAta;
@@ -1003,28 +1012,29 @@ export class RealTrader {
       const acc = await accP;
       const [curveAcc, mintAcc, userAcc, ataSplAcc, ata2022Acc] = acc?.value || [];
       if (!curveAcc || curveAcc.owner !== PD.PUMP_PROGRAM) return null; // not on pump.fun's curve
-      curve = PD.decodeCurve(curveAcc.data?.[0]);
-      const blocker = PD.directBlocker(curve);
-      if (blocker) {
-        if (side === 'buy' && blocker === 'curve is not priced in SOL') {
-          throw Object.assign(new Error('curve is not priced in SOL (token-paired curve skipped)'), { skipBuy: true });
-        }
-        this.noteFallback(blocker);
-        return null;
-      }
       baseTokenProgram = mintAcc?.owner;
-      if (baseTokenProgram !== PD.TOKEN_PROGRAM && baseTokenProgram !== PD.TOKEN_2022_PROGRAM) return null;
-      if (!cachedMeta?.tokenProgram) {
-        this.mintMetaCache.set(mint, { ...(cachedMeta || {}), tokenProgram: baseTokenProgram });
+      if (baseTokenProgram === PD.TOKEN_PROGRAM || baseTokenProgram === PD.TOKEN_2022_PROGRAM) {
+        userAta = baseTokenProgram === PD.TOKEN_2022_PROGRAM ? ata2022 : ataSpl;
+        const ataAcc = baseTokenProgram === PD.TOKEN_2022_PROGRAM ? ata2022Acc : ataSplAcc;
+        preTokens = ataAcc ? PD.tokenAccountAmount(ataAcc.data?.[0]) : 0n;
+        ataExists = Boolean(ataAcc);
+        if (!cachedMeta?.tokenProgram || preTokens > 0n) {
+          this.mintMetaCache.set(mint, { ...(cachedMeta || {}), tokenProgram: baseTokenProgram, ...(preTokens > 0n ? { heldRaw: preTokens, estimated: false } : {}) });
+        }
       }
-      userAta = baseTokenProgram === PD.TOKEN_2022_PROGRAM ? ata2022 : ataSpl;
-      const ataAcc = baseTokenProgram === PD.TOKEN_2022_PROGRAM ? ata2022Acc : ataSplAcc;
-      preTokens = ataAcc ? PD.tokenAccountAmount(ataAcc.data?.[0]) : 0n;
-      ataExists = Boolean(ataAcc);
       preLamports = BigInt(userAcc?.lamports || 0);
       if (!this.balance && preLamports > 0n) {
         this.balance = { sol: Number(preLamports) / LAMPORTS, usdc: 0, at: this.now() };
       }
+      curve = PD.decodeCurve(curveAcc.data?.[0]);
+      const blocker = PD.directBlocker(curve);
+      if (blocker) {
+        const tokDec = Number.isInteger(token?.decimals) ? token.decimals : this.decimals.get(mint) ?? 6;
+        this.decimals.set(mint, tokDec);
+        this.noteFallback(blocker);
+        return null;
+      }
+      if (baseTokenProgram !== PD.TOKEN_PROGRAM && baseTokenProgram !== PD.TOKEN_2022_PROGRAM) return null;
       blockhash = await bhP;
     }
     const tokDec = Number.isInteger(token?.decimals) ? token.decimals : this.decimals.get(mint) ?? 6;

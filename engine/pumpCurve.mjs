@@ -5,7 +5,7 @@
  * reserves. Reading it gives the exact current price, market cap and the SOL really in the
  * pool. Graduated curves (`complete`) have moved to an AMM, where DexScreener is used instead.
  */
-import { findProgramAddress, base58Decode } from './onchainMeta.mjs';
+import { findProgramAddress, base58Decode, base58Encode } from './onchainMeta.mjs';
 
 export const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 export const RAYDIUM_LAUNCHLAB_PROGRAM = 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj';
@@ -80,11 +80,74 @@ export function launchLabMetrics(pool, solPriceUsd) {
   };
 }
 
+const ZERO_KEY = '11111111111111111111111111111111';
+const quoteMintPriceCache = new Map(); // quoteMint → { priceUsd, decimals, at }
+
+async function resolveQuoteMintPrices(quoteMints) {
+  const now = Date.now();
+  const missing = [...new Set(quoteMints)].filter((m) => {
+    const c = quoteMintPriceCache.get(m);
+    return !c || now - c.at > 30_000;
+  });
+  if (missing.length && typeof fetch === 'function') {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${missing.map(encodeURIComponent).join(',')}`);
+      if (res.ok) {
+        const data = await res.json();
+        const best = new Map();
+        for (const pair of Array.isArray(data?.pairs) ? data.pairs : []) {
+          const mint = pair?.baseToken?.address;
+          const px = Number(pair?.priceUsd);
+          if (!missing.includes(mint) || !(px > 0)) continue;
+          const liq = Number(pair?.liquidity?.usd || 0);
+          const prev = best.get(mint);
+          if (!prev || liq > prev.liq) best.set(mint, { priceUsd: px, decimals: 6, liq });
+        }
+        for (const [m, v] of best) {
+          quoteMintPriceCache.set(m, { priceUsd: v.priceUsd, decimals: v.decimals, at: now });
+        }
+      }
+    } catch {
+      // keep last cached price on transient network hiccup
+    }
+  }
+  return quoteMintPriceCache;
+}
+
+export function tokenPairedCurveMetrics(curve, quotePriceUsd, quoteDecimals = 6) {
+  if (!curve || curve.solPaired !== false || !(curve.virtualTokenReserves > 0) || !(curve.virtualSolReserves > 0) || !(quotePriceUsd > 0)) return null;
+  const priceInQuote = curve.virtualSolReserves / 10 ** quoteDecimals / (curve.virtualTokenReserves / 10 ** TOKEN_DECIMALS);
+  const priceUsd = priceInQuote * quotePriceUsd;
+  const supply = curve.tokenTotalSupply / 10 ** TOKEN_DECIMALS;
+  return {
+    priceUsd,
+    marketCapUsd: priceUsd * supply,
+    liquidityUsd: (curve.realSolReserves / 10 ** quoteDecimals) * quotePriceUsd * 2,
+    complete: curve.complete,
+    source: 'pump-curve',
+    curve: {
+      virtualTokenReserves: curve.virtualTokenReserves,
+      virtualSolReserves: 0,
+      virtualQuoteReserves: curve.virtualSolReserves,
+      realTokenReserves: curve.realTokenReserves,
+      realSolReserves: 0,
+      realQuoteReserves: curve.realSolReserves,
+      quoteMint: curve.quoteMint,
+      solPaired: false,
+      mayhem: Boolean(curve.mayhem),
+      cashback: Boolean(curve.cashback),
+      at: Date.now(),
+    },
+  };
+}
+
 /** Decode the BondingCurve account: 8-byte discriminator, five u64 fields, `complete` flag. */
 export function parseBondingCurve(data) {
   const b = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'base64');
   if (b.length < 8 + 8 * 5 + 1) return null;
   const u64 = (o) => Number(b.readBigUInt64LE(o));
+  const rawQuote = b.length >= 115 ? base58Encode(b.subarray(83, 115)) : ZERO_KEY;
+  const quoteMint = rawQuote === ZERO_KEY ? WSOL_MINT : rawQuote;
   return {
     virtualTokenReserves: u64(8),
     virtualSolReserves: u64(16),
@@ -94,6 +157,8 @@ export function parseBondingCurve(data) {
     complete: b[48] === 1,
     mayhem: b.length > 81 ? b[81] === 1 : false,
     cashback: b.length > 82 ? b[82] === 1 : false,
+    quoteMint,
+    solPaired: quoteMint === WSOL_MINT,
   };
 }
 
@@ -153,17 +218,33 @@ export async function fetchPumpCurves(rpc, mints, solPriceUsd, launchLabMints = 
   }
   if (!valid.length) return out;
   const res = await rpc('getMultipleAccounts', [valid.map(([, p]) => p), { encoding: 'base64', commitment: 'processed' }]);
+  const pendingNonSol = [];
   (res?.value || []).forEach((acc, i) => {
     if (!acc || !acc.data?.[0]) return;
     const [mint] = valid[i];
     if (acc.owner === PUMP_PROGRAM) {
-      const m = curveMetrics(parseBondingCurve(acc.data[0]), solPriceUsd);
+      const c = parseBondingCurve(acc.data[0]);
+      if (c && !c.complete && c.solPaired === false) {
+        pendingNonSol.push({ mint, curve: c });
+        return;
+      }
+      const m = curveMetrics(c, solPriceUsd);
       if (m && !m.complete) out.set(mint, m);
     } else if (acc.owner === RAYDIUM_LAUNCHLAB_PROGRAM && !out.has(mint)) {
       const m = launchLabMetrics(parseLaunchLabPool(acc.data[0]), solPriceUsd);
       if (m && !m.complete) out.set(mint, m);
     }
   });
+  if (pendingNonSol.length) {
+    const qPrices = await resolveQuoteMintPrices(pendingNonSol.map((x) => x.curve.quoteMint));
+    for (const { mint, curve } of pendingNonSol) {
+      const q = qPrices.get(curve.quoteMint);
+      if (q && q.priceUsd > 0) {
+        const m = tokenPairedCurveMetrics(curve, q.priceUsd, q.decimals || 6);
+        if (m && !m.complete) out.set(mint, m);
+      }
+    }
+  }
   return out;
 }
 
