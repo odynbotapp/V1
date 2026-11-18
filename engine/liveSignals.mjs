@@ -228,6 +228,7 @@ export class LiveSignalService {
       traderHandle: follow ? follow.handle : sig.label || sig.wallet,
       traderWallet: sig.wallet,
       signature: sig.signature,
+      slot: Number.isInteger(sig.slot) && sig.slot > 0 ? sig.slot : undefined,
       ageSec: sig.blockTime ? Math.max(0, (Date.now() - sig.blockTime) / 1000) : undefined,
       traderBuyUsd: sig.usdValue,
       traderBuyNative: sig.quoteSymbol === 'SOL' ? sig.quoteAmount : undefined,
@@ -251,6 +252,7 @@ export class LiveSignalService {
         imageUrl: sig.imageUrl || null,
         createdAt: sig.pairCreatedAt || null,
         venue: sig.venue || null,
+        slot: Number.isInteger(sig.slot) && sig.slot > 0 ? sig.slot : null,
         curve: sig.curve || null,
         // Freeze / mint authority come from Alchemy token metadata when available
         safety: sig.authorityKnown

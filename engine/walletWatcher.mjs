@@ -1555,6 +1555,7 @@ export class SolanaWalletWatcher {
       mintAuthority: info?.authorityKnown ? info.mintAuthority ?? null : null,
       freezeAuthority: info?.authorityKnown ? info.freezeAuthority ?? null : null,
       venue: swap.venue || null,
+      slot: Number.isInteger(swap.slot) && swap.slot > 0 ? swap.slot : null,
       poolQuoteAmount: swap.poolQuoteAmount ?? null,
       curve:
         swap.curve && Number(swap.curve.virtualSolReserves) > 0 && Number(swap.curve.virtualTokenReserves) > 0

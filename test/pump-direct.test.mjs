@@ -688,15 +688,16 @@ test('PD24 Part 1 Infra: multi-relay variant fan-out (Jito + Nozomi + Astralane)
     return origRpc(method, params);
   };
 
-  const q = await trader.quote({ side: 'buy', token, amountUsd: 65, slippagePct: 15 });
-  const r = await trader.execute({ side: 'buy', token, amountUsd: 65, quote: q, slippagePct: 15, newTokenAccount: true });
+  const slotToken = { ...token, slot: 470_521_108 };
+  const q = await trader.quote({ side: 'buy', token: slotToken, amountUsd: 65, slippagePct: 15 });
+  const r = await trader.execute({ side: 'buy', token: slotToken, amountUsd: 65, quote: q, slippagePct: 15, newTokenAccount: true });
   assert.equal(r.ok, true, r.error);
   assert.equal(blasts.length, 3, 'blasted to all 3 relays in RTT order');
   assert.ok(blasts[0].url.includes('astralane'), 'Astralane fired first');
   assert.ok(blasts[1].url.includes('nozomi'), 'Nozomi fired second');
   assert.ok(blasts[2].url.includes('jito.wtf') && blasts[2].url.includes('bundleOnly=true'), 'Jito fired third with bundleOnly=true');
 
-  // Decode each relay's transaction to verify non-idempotent Create ATA guard + provider-specific tip account
+  // Decode each relay's transaction to verify non-idempotent Create ATA guard + provider-specific tip account + Lighthouse slot deadline
   const decodeTxIxs = (b64) => {
     const tx = Buffer.from(b64, 'base64');
     const n = tx[0];
@@ -727,7 +728,19 @@ test('PD24 Part 1 Infra: multi-relay variant fan-out (Jito + Nozomi + Astralane)
     const ataIx = list.find((ix) => ix.programId === PD.ATA_PROGRAM);
     assert.ok(ataIx, `${label}: includes ATA instruction`);
     assert.deepEqual([...ataIx.data], [0], `${label}: uses non-idempotent Create (0) as native on-chain race guard`);
+    const lhIx = list.find((ix) => ix.programId === PD.LIGHTHOUSE_PROGRAM);
+    assert.ok(lhIx, `${label}: includes Lighthouse slot deadline instruction`);
+    assert.deepEqual([...lhIx.data.subarray(0, 3)], [0x0f, 0x00, 0x00], `${label}: AssertSysvarClock Slot header`);
+    assert.equal(lhIx.data.readBigUInt64LE(3), 470_521_114n, `${label}: maxSlot = traderSlot (470521108) + 6`);
+    assert.equal(lhIx.data[11], 0x05, `${label}: operator <= (0x05)`);
   }
+
+  for (const pool of Object.values(PD.RELAY_TIP_ACCOUNTS)) {
+    for (const acc of pool) assert.equal(base58Decode(acc).length, 32, `valid 32-byte tip address: ${acc}`);
+  }
+  assert.equal(PD.detectRelayKind('https://eu.stellium.io/rpc'), 'stellium');
+  assert.equal(PD.detectRelayKind('https://rpc.landx.io'), 'landx');
+  assert.equal(PD.detectRelayKind('https://tx.speedy.sol'), 'speedy');
 
   const astraTip = astraIxs.find((ix) => ix.programId === PD.SYSTEM_PROGRAM && ix.data.length === 12);
   const nozomiTip = nozomiIxs.find((ix) => ix.programId === PD.SYSTEM_PROGRAM && ix.data.length === 12);

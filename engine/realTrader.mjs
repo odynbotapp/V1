@@ -1030,7 +1030,13 @@ export class RealTrader {
     const tokDec = Number.isInteger(token?.decimals) ? token.decimals : this.decimals.get(mint) ?? 6;
     this.decimals.set(mint, tokDec);
     let quotedPriceUsd;
-    const d = { curve, baseTokenProgram, userAta, ataExists, preTokens, preLamports, fastCurve: Boolean(fastTc), tokDec, blockhash };
+    const traderSlot =
+      Number.isInteger(token?.slot) && token.slot > 0
+        ? token.slot
+        : Number.isInteger(token?.curve?.slot) && token.curve.slot > 0
+          ? token.curve.slot
+          : null;
+    const d = { curve, baseTokenProgram, userAta, ataExists, preTokens, preLamports, fastCurve: Boolean(fastTc), tokDec, blockhash, traderSlot };
     if (side === 'buy') {
       const lamportsIn = BigInt(Math.floor((amountUsd / px) * 1e9));
       const tokensOut = PD.quoteBuy(curve, lamportsIn);
@@ -1113,6 +1119,10 @@ export class RealTrader {
         minOut = (d.tokensOut * keep) / 10_000n;
         if (minOut <= 0n) return { fallback: true, error: 'minimum tokens is 0' };
         coreIxs = [...budget, createAtaFn({ payer: this.address, owner: this.address, mint, tokenProgram: d.baseTokenProgram }), PD.buyExactQuoteInIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, lamportsIn: d.lamportsIn, minTokensOut: minOut, buybackFeeRecipient: buyback })];
+        const maxDrift = Number(this.maxSlotDrift ?? 6);
+        if (Number.isInteger(d.traderSlot) && d.traderSlot > 0 && Number.isFinite(maxDrift) && maxDrift > 0) {
+          coreIxs.push(PD.lighthouseSlotDeadlineIx({ maxSlot: BigInt(d.traderSlot + Math.round(maxDrift)) }));
+        }
       } else {
         minOut = (d.lamportsOut * keep) / 10_000n;
         coreIxs = [...budget, PD.sellIx({ user: this.address, mint, baseTokenProgram: d.baseTokenProgram, amount: d.amount, minSolOutput: minOut, buybackFeeRecipient: buyback })];
@@ -1268,6 +1278,9 @@ export class RealTrader {
       const code = PD.customErrorCode(errObj);
       if (code === 6023 && side === 'sell') this.mintMetaCache?.delete(mint);
       if (PRICE_CODES.has(code)) return { priceMoved: true, error: `pump.fun refused: price moved past the limit while sending (${code})`, signature: sig };
+      if (side === 'buy' && code !== null && code >= 6400 && code <= 6500) {
+        return { late: true, error: `Lighthouse slot deadline exceeded on-chain (${code})`, signature: sig };
+      }
       return { fallback: true, sentFailed: true, signature: sig, error: `direct swap failed on-chain${code !== null ? ` (${code})` : ''}` };
     }
     this.directStats.direct += 1;

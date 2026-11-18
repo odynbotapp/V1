@@ -159,6 +159,9 @@ const extraSwqosEndpoints = [
   process.env.ASTRALANE_RPC_URL ? String(process.env.ASTRALANE_RPC_URL).trim() : null,
   process.env.NEXTBLOCK_RPC_URL ? String(process.env.NEXTBLOCK_RPC_URL).trim() : null,
   process.env.BLOCKRAZOR_RPC_URL ? String(process.env.BLOCKRAZOR_RPC_URL).trim() : null,
+  process.env.STELLIUM_RPC_URL ? String(process.env.STELLIUM_RPC_URL).trim() : null,
+  process.env.LANDX_RPC_URL ? String(process.env.LANDX_RPC_URL).trim() : null,
+  process.env.SPEEDY_RPC_URL ? String(process.env.SPEEDY_RPC_URL).trim() : null,
 ].filter(Boolean);
 // Sodae (optional): also receives our signed swaps (one credit each) — never used for routine reads,
 // so the free tier's 100k monthly credits last

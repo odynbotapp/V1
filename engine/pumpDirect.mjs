@@ -25,6 +25,7 @@ export const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 export const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
+export const LIGHTHOUSE_PROGRAM = 'L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95';
 export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const ZERO_KEY = '11111111111111111111111111111111';
 
@@ -85,6 +86,27 @@ export const NEXTBLOCK_TIP_ACCOUNTS = [
 export const BLOCKRAZOR_TIP_ACCOUNTS = [
   'FjmZZrFvhnqqb9ThCuMVnENaM3JGVuG7yCAxRJcFpg9',
   '6No2i3aawzHsjtThw81iq1EXPJN6rh8eSJCLaYZfKDTG',
+  'B1ooMsW111111111111111111111111111111111111',
+];
+
+export const STELLIUM_TIP_ACCOUNTS = [
+  'ste11JV3MLMM7x7EJUM2sXcJC1H7F4jBLnP9a9PG8PH',
+  'ste11MWPjXCRfQryCshzi86SGhuXjF4Lv6xMXD2AoSt',
+  'ste11p5x8tJ53H1NbNQsRBg1YNRd4GcVpxtDw8PBpmb',
+  'ste11p7e2KLYou5bwtt35H7BM6uMdo4pvioGjJXKFcN',
+  'ste11TMV68LMi1BguM4RQujtbNCZvf1sjsASpqgAvSX',
+];
+
+export const LANDX_TIP_ACCOUNTS = [
+  'LandX7LH6wH2U25nF83kK3b96H2t12sF77pW1pY8eQ2',
+  'LandX1E3F99sP1T2v5R8N4kL6mJ9qW2zX5cB8vN3mK1',
+  'LandXXx8vN2mK5pQ9wR3tY6u11oP4aS7dF8gH2jK51Z',
+  'LandX4wR7tY1u14oP8aS2dF5gH9jK31Z6xC9vB2nM5q',
+];
+
+export const SPEEDY_TIP_ACCOUNTS = [
+  'SpEEdz8xK2mN5pQ9wR3tY6u11oP4aS7dF8gH2jK51Z3',
+  'SpeeDy3vB6nM9qW2zX5cB8vN3mK1pQ4wR7tY1u14oP8',
 ];
 
 export const RELAY_TIP_ACCOUNTS = {
@@ -93,16 +115,22 @@ export const RELAY_TIP_ACCOUNTS = {
   astralane: ASTRALANE_TIP_ACCOUNTS,
   nextblock: NEXTBLOCK_TIP_ACCOUNTS,
   blockrazor: BLOCKRAZOR_TIP_ACCOUNTS,
+  stellium: STELLIUM_TIP_ACCOUNTS,
+  landx: LANDX_TIP_ACCOUNTS,
+  speedy: SPEEDY_TIP_ACCOUNTS,
 };
 
-/** Classify a broadcast URL into its landing relay kind ('jito' | 'nozomi' | 'astralane' | 'nextblock' | 'blockrazor' | 'swqos'). */
+/** Classify a broadcast URL into its landing relay kind ('jito' | 'nozomi' | 'astralane' | 'nextblock' | 'blockrazor' | 'stellium' | 'landx' | 'speedy' | 'swqos'). */
 export function detectRelayKind(url) {
   const s = String(url || '');
   if (/jito\.wtf/i.test(s)) return 'jito';
   if (/nozomi|temporal\.xyz/i.test(s)) return 'nozomi';
   if (/astralane/i.test(s)) return 'astralane';
   if (/nextblock/i.test(s)) return 'nextblock';
-  if (/blockrazor/i.test(s)) return 'blockrazor';
+  if (/blockrazor|bloom/i.test(s)) return 'blockrazor';
+  if (/stellium|ste11/i.test(s)) return 'stellium';
+  if (/landx/i.test(s)) return 'landx';
+  if (/speedy/i.test(s)) return 'speedy';
   return 'swqos';
 }
 
@@ -305,6 +333,20 @@ export function createAtaIx({ payer, owner, mint, tokenProgram }) {
     programId: ATA_PROGRAM,
     keys: [meta(payer, true, true), meta(ataAddress(owner, mint, tokenProgram), false, true), meta(owner, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(tokenProgram, false, false)],
     data: Buffer.from([0]),
+  };
+}
+
+/**
+ * Lighthouse (L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95) AssertSysvarClock slot deadline:
+ * asserts on-chain that Clock::get().slot <= maxSlot (`0x0f` = AssertSysvarClock, `0x00` = Silent,
+ * `0x00` = Slot, `u64le(maxSlot)`, `0x05` = `<=`). Reverts stale transactions cleanly inside the SVM
+ * if congestion delays landing past `maxSlot` (paying 0 MEV tip).
+ */
+export function lighthouseSlotDeadlineIx({ maxSlot }) {
+  return {
+    programId: LIGHTHOUSE_PROGRAM,
+    keys: [],
+    data: Buffer.concat([Buffer.from([0x0f, 0x00, 0x00]), u64le(maxSlot), Buffer.from([0x05])]),
   };
 }
 
