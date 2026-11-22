@@ -370,3 +370,70 @@ test('LS6 Proxy gRPC SubscribeEntries stream + SolanaWalletWatcher pre-execution
   server.close();
   server.emit('close');
 });
+
+test('LS7 Bug #1 & #2 regressions: zero minTokensOut never produces fake $375B MC, and non-pre-parsed shreds never lock seenSigs before Yellowstone gRPC', async () => {
+  // Bug #1: minTokensOut = 0 (unlimited slippage buy) -> priceInQuote = 0 (never 2.5 SOL/token -> $375B MC)
+  const zeroMinIx = buyExactQuoteInIx({
+    user: DECU,
+    mint: MINT,
+    baseTokenProgram: TOKEN_2022_PROGRAM,
+    lamportsIn: 2_500_000_000n,
+    minTokensOut: 0n,
+  });
+  const { rawBytes: rawZero, signature: sigZero } = buildRawLegacyTx({ payer: DECU, instructions: [zeroMinIx] });
+  const { tx: decodedZero } = decodeVersionedTransactionAt(rawZero, 0);
+  const swapZero = extractSwapFromRawTx(decodedZero, DECU, { slot: 465_600_000 });
+  assert.ok(swapZero);
+  assert.equal(swapZero.tokenAmount, 0, 'minTokensOut=0 does not fabricate tokenAmount=1');
+  assert.equal(swapZero.priceInQuote, 0, 'minTokensOut=0 does not fabricate 2.5 SOL/token price');
+
+  // When live bonding curve is fetched by fastShredTrade, true post-trader price & virtual reserves are computed
+  const curveBuf = Buffer.alloc(151);
+  Buffer.from([23, 183, 248, 55, 96, 216, 172, 96]).copy(curveBuf, 0);
+  curveBuf.writeBigUInt64LE(1_073_000_000_000_000n, 8); // virtualTokenReserves
+  curveBuf.writeBigUInt64LE(30_000_000_000n, 16); // virtualQuoteReserves (30 SOL)
+  curveBuf.writeBigUInt64LE(793_100_000_000_000n, 24); // realTokenReserves
+  curveBuf.writeBigUInt64LE(0n, 32); // realQuoteReserves
+  curveBuf.writeBigUInt64LE(1_000_000_000_000_000n, 40);
+  curveBuf[48] = 0; // not complete
+  Buffer.from(base58Decode(WSOL_MINT)).copy(curveBuf, 83);
+
+  const signals = [];
+  const watcher = new SolanaWalletWatcher({
+    rpcUrl: 'http://127.0.0.1:9',
+    stream: false,
+    tokenInfo: {
+      cache: new Map(),
+      ttlMs: 60_000,
+      get: async () => null,
+      solPriceFast: async () => 150,
+      solPriceUsd: async () => 150,
+    },
+    onSignal: (s) => signals.push(s),
+  });
+  watcher.fastDetect = () => true;
+  watcher.confirmDelaysMs = [];
+  watcher.rpc = async (method) => {
+    if (method === 'getAccountInfo') return { value: { data: [curveBuf.toString('base64'), 'base64'] } };
+    return null;
+  };
+  watcher.setWallets([{ address: DECU, label: '@Decu' }]);
+
+  await watcher.fastShredTrade(watcher.wallets.get(DECU), { signature: sigZero, slot: 465_600_000, receivedAt: Date.now() }, swapZero);
+  assert.equal(signals.length, 1);
+  // Real pump.fun 30 SOL -> 32.5 SOL curve: ~81M tokens out for 2.5 SOL -> MC around ~$4,600 (never $375B!)
+  assert.ok(signals[0].marketCapUsd > 3000 && signals[0].marketCapUsd < 10000, `realistic MC from live curve (got ${signals[0].marketCapUsd})`);
+  assert.ok(signals[0].curve?.virtualSolReserves === 32_500_000_000, 'post-trader virtualSolReserves computed from live curve');
+
+  // Bug #2: non-pre-parsed shred (e.g. PumpSwap / Jupiter) must NOT lock seenSigs or enqueue slow getTransaction polling
+  const nonParsedSig = 'NonPreParsedShredSig111111111111111111111111111111111111111111';
+  watcher.handleShredTx(DECU, {
+    signature: nonParsedSig,
+    slot: 465_600_001,
+    receivedAt: Date.now(),
+    rawTx: { signature: nonParsedSig, signers: [DECU], staticAccountKeys: [DECU] },
+    preParsedSwap: null,
+  });
+  assert.equal(watcher.seenSigs.has(nonParsedSig), false, 'non-pre-parsed shred does not lock seenSigs');
+  assert.equal(watcher.streamQueue.length, 0, 'non-pre-parsed shred does not queue slow getTransaction poll');
+});

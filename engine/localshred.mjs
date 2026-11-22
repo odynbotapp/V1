@@ -433,18 +433,22 @@ export function extractSwapFromRawTx(rawTx, wallet, { slot = null } = {}) {
       const minTokensOut = ix.data.readBigUInt64LE(16);
       if (lamportsIn <= 0n) continue;
       const solAmt = Number(lamportsIn) / LAMPORTS_PER_SOL;
-      const tokAmt = minTokensOut > 0n ? Number(minTokensOut) / 1e6 : 1;
+      // minTokensOut is a slippage floor (not the true fill) and may be 0 or tiny (e.g. 1 raw unit).
+      // Only derive an approximate price when minTokensOut is >= 1,000 UI tokens; otherwise mark
+      // priceInQuote = 0 so the watcher enriches from the live on-chain bonding curve (no $375B fake MC).
+      const rawTokAmt = minTokensOut >= 1_000_000_000n ? Number(minTokensOut) / 1e6 : 0;
       return {
         side: 'buy',
         sellSharePct: null,
         tokenMint: mint,
         tokenDecimals: 6,
-        tokenAmount: tokAmt,
+        tokenAmount: rawTokAmt,
         quoteSymbol: 'SOL',
         quoteMint: WSOL_MINT,
         quoteAmount: solAmt,
         poolQuoteAmount: solAmt,
-        priceInQuote: tokAmt > 0 ? solAmt / tokAmt : 0,
+        priceInQuote: rawTokAmt > 0 ? solAmt / rawTokAmt : 0,
+        minOutIsFloor: true,
         venue: 'pumpfun',
         signature: rawTx.signature,
         slot,
@@ -535,19 +539,20 @@ export function extractSwapFromRawTx(rawTx, wallet, { slot = null } = {}) {
       const secondU64 = ix.data.readBigUInt64LE(10);
       if (ix.data[0] === 0 && firstU64 > 0n && quoteMint === WSOL_MINT) {
         const solAmt = Number(firstU64) / LAMPORTS_PER_SOL;
-        const tokAmt = secondU64 > 0n ? Number(secondU64) / 1e6 : 1;
+        const rawTokAmt = secondU64 >= 1_000_000_000n ? Number(secondU64) / 1e6 : 0;
         if (solAmt > 0 && solAmt < 1000) {
           return {
             side: 'buy',
             sellSharePct: null,
             tokenMint: mint,
             tokenDecimals: 6,
-            tokenAmount: tokAmt,
+            tokenAmount: rawTokAmt,
             quoteSymbol: 'SOL',
             quoteMint: WSOL_MINT,
             quoteAmount: solAmt,
             poolQuoteAmount: solAmt,
-            priceInQuote: tokAmt > 0 ? solAmt / tokAmt : 0,
+            priceInQuote: rawTokAmt > 0 ? solAmt / rawTokAmt : 0,
+            minOutIsFloor: true,
             venue: 'pumpfun',
             signature: rawTx.signature,
             slot,

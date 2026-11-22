@@ -19,6 +19,7 @@ export function isPumpFunCoin(swap) {
   return Boolean(swap && /pump$/.test(String(swap.tokenMint || '')) && (swap.venue === 'pumpfun' || swap.venue === 'pumpswap'));
 }
 import { bondingCurvePda, RAYDIUM_LAUNCHLAB_PROGRAM } from './pumpCurve.mjs';
+import { decodeCurve, quoteBuy as pumpQuoteBuy, quoteSell as pumpQuoteSell } from './pumpDirect.mjs';
 import { pumpTradeFromLogs, swapFromPumpTrade, pumpSwapTradeFromLogs, swapFromPumpSwapTrade, decodePumpSwapPool, launchLabTradeFromLogs } from './pumpLogs.mjs';
 import { YellowstoneFeed } from './yellowstone.mjs';
 import { LocalShredFeed } from './localshred.mjs';
@@ -880,33 +881,104 @@ export class SolanaWalletWatcher {
 
   /**
    * Handle a raw transaction decoded from LocalShred Lite / ShredStream before execution.
-   * If `fastDetect` is enabled and `ev.preParsedSwap` was decoded from the raw instruction bytes,
-   * triggers an immediate pre-execution fast trade (`fastTxTrade`) and verifies confirmation in background.
-   * Otherwise queues the signature to race the confirmation RPCs as soon as the leader executes it.
+   * Only acts when `fastDetect` is ON and `ev.preParsedSwap` was decoded from raw instruction bytes.
+   * When `ev.preParsedSwap` is null (e.g., PumpSwap/LaunchLab/Jupiter/non-swap), returns without
+   * locking `seenSigs` so Yellowstone gRPC's 0-RPC `processed` feed handles it immediately 50-100 ms later.
    */
   handleShredTx(address, ev) {
     if (!ev?.signature) return;
     const w = this.wallets.get(address);
     if (!w) return;
-    if (!this.firstSeenBy.has(ev.signature)) {
-      this.firstSeenBy.set(ev.signature, 'shred');
-      this.feedRace.shred = (this.feedRace.shred || 0) + 1;
-      if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
-    }
     if (this.seenSigs.has(ev.signature)) return;
     // Ignore transactions where the watched wallet is not a signer (spam / dust transfers)
     if (Array.isArray(ev.rawTx?.signers) && !ev.rawTx.signers.includes(address)) {
       this.spamSigs.add(ev.signature);
       return;
     }
-    this.streamStats.swapsSeen += 1;
-    if (this.fastDetect() && ev.preParsedSwap && !ev.preParsedSwap.skip) {
-      this.fastTxTrade(w, ev, ev.preParsedSwap);
+    if (!this.fastDetect() || !ev.preParsedSwap || ev.preParsedSwap.skip) {
+      // Do NOT push to streamQueue or lock seenSigs: let Yellowstone gRPC / Helius WS handle
+      // non-pre-parsed swaps with 0-RPC full balances & logs instead of blocking them with getTransaction polling.
       return;
     }
-    this.streamQueue.push({ w, ev });
-    if (this.streamQueue.length > 200) this.streamQueue.splice(0, this.streamQueue.length - 200);
-    this.drainStream();
+    if (!this.firstSeenBy.has(ev.signature)) {
+      this.firstSeenBy.set(ev.signature, 'shred');
+      this.feedRace.shred = (this.feedRace.shred || 0) + 1;
+      if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
+    }
+    this.streamStats.swapsSeen += 1;
+    this.fastShredTrade(w, ev, ev.preParsedSwap);
+  }
+
+  /**
+   * Fast path for a pre-execution Pump.fun swap decoded from LocalShred raw instructions.
+   * Reads the live on-chain bonding curve (`processed`) in 1 fast RPC call (~15-20ms) to compute the
+   * true post-trader virtual reserves and exact fill price (never using `minTokensOut` slippage floor
+   * as `traderFillPriceUsd` or `marketCapUsd`), then triggers `fastTxTrade` with real curve reserves
+   * so `RealTrader.directQuote` hits its 0-RPC `fastCurve` path and blasts in parallel immediately.
+   */
+  async fastShredTrade(w, ev, preSwap) {
+    const sig = ev.signature;
+    if (this.seenSigs.has(sig)) return null;
+    const swap = { ...preSwap, curve: preSwap.curve ? { ...preSwap.curve } : null };
+    try {
+      const pda = bondingCurvePda(swap.tokenMint);
+      const acc = await this.rpc('getAccountInfo', [pda, { encoding: 'base64', commitment: 'processed' }], { fast: true });
+      if (this.seenSigs.has(sig)) return null; // Yellowstone gRPC already beat us with exact post-tx reserves
+      const curve = acc?.value?.data?.[0] ? decodeCurve(acc.value.data[0]) : null;
+      if (curve && !curve.complete && curve.solPaired && curve.virtualQuoteReserves > 0n && curve.virtualTokenReserves > 0n) {
+        if (swap.side === 'buy') {
+          const lamportsIn = BigInt(Math.round(swap.quoteAmount * LAMPORTS_PER_SOL));
+          const estTokensRaw = pumpQuoteBuy(curve, lamportsIn);
+          if (estTokensRaw > 0n) {
+            const estTokens = Number(estTokensRaw) / 1e6;
+            const postVQuote = Number(curve.virtualQuoteReserves + lamportsIn);
+            const postVTokens = Math.max(1, Number(curve.virtualTokenReserves - estTokensRaw));
+            const postRTokens = Math.max(0, Number(curve.realTokenReserves > estTokensRaw ? curve.realTokenReserves - estTokensRaw : 0n));
+            const postRSol = Number(curve.realQuoteReserves + lamportsIn);
+            swap.tokenAmount = estTokens;
+            swap.priceInQuote = swap.quoteAmount / estTokens;
+            swap.curve = {
+              virtualSolReserves: postVQuote,
+              virtualTokenReserves: postVTokens,
+              realTokenReserves: postRTokens,
+              realSolReserves: postRSol,
+              mayhem: Boolean(curve.isMayhem),
+              cashback: Boolean(curve.isCashback),
+              tokenProgram: swap.curve?.tokenProgram || null,
+              preExecution: true,
+              at: Date.now(),
+            };
+          }
+        } else if (swap.side === 'sell' && swap.tokenAmount > 0) {
+          const tokRaw = BigInt(Math.round(swap.tokenAmount * 1e6));
+          const estSolRaw = pumpQuoteSell(curve, tokRaw);
+          if (estSolRaw > 0n) {
+            swap.quoteAmount = Number(estSolRaw) / LAMPORTS_PER_SOL;
+            swap.poolQuoteAmount = swap.quoteAmount;
+            swap.priceInQuote = swap.quoteAmount / swap.tokenAmount;
+            swap.curve = {
+              virtualSolReserves: Math.max(1, Number(curve.virtualQuoteReserves > estSolRaw ? curve.virtualQuoteReserves - estSolRaw : 1n)),
+              virtualTokenReserves: Number(curve.virtualTokenReserves + tokRaw),
+              realTokenReserves: Number(curve.realTokenReserves + tokRaw),
+              realSolReserves: Math.max(0, Number(curve.realQuoteReserves > estSolRaw ? curve.realQuoteReserves - estSolRaw : 0n)),
+              mayhem: Boolean(curve.isMayhem),
+              cashback: Boolean(curve.isCashback),
+              tokenProgram: swap.curve?.tokenProgram || null,
+              preExecution: true,
+              at: Date.now(),
+            };
+          }
+        }
+      }
+    } catch {
+      // Curve lookup failed: if priceInQuote is missing (e.g. minTokensOut was 0), let gRPC handle it
+    }
+    if (this.seenSigs.has(sig)) return null;
+    if (!(swap.priceInQuote > 0) || !(swap.tokenAmount > 0)) {
+      // Never emit a signal with bogus 0 or $375B price — let Yellowstone gRPC deliver the exact executed fill
+      return null;
+    }
+    return this.fastTxTrade(w, ev, swap);
   }
 
   /** Resolve and cache { baseMint, quoteMint, decimals } for a PumpSwap pool account. */
