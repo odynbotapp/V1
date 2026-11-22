@@ -63,6 +63,11 @@ export class LiveSignalService {
     const rawGrpcUrl = String(env.SODAE_GRPC_URL || env.YELLOWSTONE_GRPC_URL || '').trim() || null;
     const grpcUrl = rawGrpcUrl && /sodae\.io:8899\b/i.test(rawGrpcUrl) ? rawGrpcUrl.replace(/:8899\b/, ':10201') : rawGrpcUrl;
     const grpcKey = grpcUrl ? (() => { try { return new URL(grpcUrl).searchParams.get('api-key'); } catch { return null; } })() : null;
+    const shredApiKey = String(env.LOCALSHRED_API_KEY || '').trim() || null;
+    const shredUrl = String(env.LOCALSHRED_URL || (shredApiKey ? 'http://localshred-lite.nlams.dedicatednodes.io:9999' : '')).trim() || null;
+    const shredProxyUrl = String(env.LOCALSHRED_PROXY_URL || '').trim() || null;
+    const shredUdpPort = Number.isInteger(Number(env.LOCALSHRED_UDP_PORT)) && Number(env.LOCALSHRED_UDP_PORT) >= 0 ? Number(env.LOCALSHRED_UDP_PORT) : 20000;
+    const shredUrlKey = shredUrl ? (() => { try { return new URL(shredUrl).searchParams.get('api-key'); } catch { return null; } })() : null;
     this.watcher =
       watcher ||
       new SolanaWalletWatcher({
@@ -85,9 +90,19 @@ export class LiveSignalService {
         ...(sodaeWs ? { extraStreamUrl: sodaeWs, extraStreamName: 'Sodae' } : {}),
         // Yellowstone gRPC (SODAE_GRPC_URL or YELLOWSTONE_GRPC_URL): the fastest feed
         ...(grpcUrl ? { grpcUrl } : {}),
-        redactUrl: (x) => redact(redact(redact(redact(x, alchemy?.apiKey), heliusKey), sodaeKey), grpcKey),
+        // LocalShred Lite / ShredStream (LOCALSHRED_URL + LOCALSHRED_API_KEY or LOCALSHRED_PROXY_URL): pre-execution shred feed
+        ...(shredUrl || shredProxyUrl
+          ? {
+              shredUrl,
+              shredApiKey,
+              shredProxyUrl,
+              shredUdpPort,
+            }
+          : {}),
+        redactUrl: (x) => redact(redact(redact(redact(redact(redact(x, alchemy?.apiKey), heliusKey), sodaeKey), grpcKey), shredApiKey), shredUrlKey),
       });
     this.heliusKey = heliusKey;
+    this.shredApiKey = shredApiKey;
     this.watcher.onSignal = (s) => this.handleSignal(s);
     this.watcher.onStatus = () => this.pushStatus();
     this.watcher.onTokenInfoLate = (mint, info) => this.applyLateTokenInfo(mint, info);
@@ -425,8 +440,13 @@ export class LiveSignalService {
     return {
       mode: 'signals-only',
       config: { ...this.config, rpcUrl: this.maskedRpcUrl(), rpcProvider: this.rpcProvider(), manual: [...this.config.manual] },
-      status: { ...status, rpcUrl: redact(redact(status.rpcUrl, key), this.heliusKey), lastError: status.lastError ? redact(redact(status.lastError, key), this.heliusKey) : null },
+      status: {
+        ...status,
+        rpcUrl: redact(redact(redact(status.rpcUrl, key), this.heliusKey), this.shredApiKey),
+        lastError: status.lastError ? redact(redact(redact(status.lastError, key), this.heliusKey), this.shredApiKey) : null,
+      },
       helius: { configured: Boolean(this.heliusKey) },
+      localshred: { configured: Boolean(this.shredApiKey || this.watcher.shredFeed) },
       alchemy: this.alchemy ? this.alchemy.status() : { configured: false },
       watchList: this.watchList(),
       ...(includeSignals ? { signals: this.signals } : {}),

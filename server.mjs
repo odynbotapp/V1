@@ -41,6 +41,12 @@ if (!process.env.SODAE_GRPC_URL && process.env.SODAE_RPC_URL && /sodae\.io/i.tes
 if (process.env.SODAE_GRPC_URL && /sodae\.io:8899\b/i.test(process.env.SODAE_GRPC_URL)) {
   process.env.SODAE_GRPC_URL = process.env.SODAE_GRPC_URL.replace(/:8899\b/, ':10201');
 }
+if (!process.env.LOCALSHRED_API_KEY && process.env.LOCALSHRED_KEY) {
+  process.env.LOCALSHRED_API_KEY = process.env.LOCALSHRED_KEY;
+}
+if (!process.env.LOCALSHRED_URL && process.env.LOCALSHRED_API_KEY) {
+  process.env.LOCALSHRED_URL = 'http://localshred-lite.nlams.dedicatednodes.io:9999';
+}
 const PORT = Number(process.env.PORT || 3400);
 // Hosting platforms (Railway) must reach the server from outside the container
 const ON_RAILWAY = Boolean(

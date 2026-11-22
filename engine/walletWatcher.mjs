@@ -21,6 +21,7 @@ export function isPumpFunCoin(swap) {
 import { bondingCurvePda, RAYDIUM_LAUNCHLAB_PROGRAM } from './pumpCurve.mjs';
 import { pumpTradeFromLogs, swapFromPumpTrade, pumpSwapTradeFromLogs, swapFromPumpSwapTrade, decodePumpSwapPool, launchLabTradeFromLogs } from './pumpLogs.mjs';
 import { YellowstoneFeed } from './yellowstone.mjs';
+import { LocalShredFeed } from './localshred.mjs';
 import { findProgramAddress, base58Decode as b58d } from './onchainMeta.mjs';
 const ASSOCIATED_TOKEN_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -536,6 +537,10 @@ export class SolanaWalletWatcher {
     extraStreamUrl = null, // a second live push feed (e.g. Sodae) racing the main one; first to see a trade wins
     extraStreamName = 'extra',
     grpcUrl = null, // Yellowstone gRPC feed (e.g. Sodae): fastest way to hear the followed wallets' trades
+    shredUrl = null, // LocalShred Lite / ShredStream upstream heartbeat endpoint (e.g. http://localshred-lite.nlams.dedicatednodes.io:9999)
+    shredApiKey = null, // LocalShred Lite x-localshred-auth API key
+    shredProxyUrl = null, // optional local shredstream-proxy gRPC SubscribeEntries URL (e.g. http://127.0.0.1:10202)
+    shredUdpPort = 20000, // local UDP port for raw data shreds when connecting directly to LocalShred Lite
     redactUrl = (x) => x,
   } = {}) {
     this.rpcUrl = rpcUrl;
@@ -595,8 +600,20 @@ export class SolanaWalletWatcher {
     // Optional second live feed (Sodae): the same transaction pushes from another provider. Both
     // feeds share the "seen signature" set, so each trade is handled once — by whichever arrived
     // first. Spam-flooded wallets are left out (their pushes would only burn the feed's credits).
-    this.feedRace = { main: 0, extra: 0, grpc: 0, extraName: extraStreamName };
+    this.feedRace = { main: 0, extra: 0, grpc: 0, shred: 0, extraName: extraStreamName };
     this.grpcFeed = grpcUrl ? new YellowstoneFeed({ url: grpcUrl, redactUrl, onTx: (address, ev) => this.handleStreamLogs(address, ev, 'grpc'), onChange: () => this.emitStatus() }) : null;
+    this.shredFeed =
+      shredUrl || shredProxyUrl
+        ? new LocalShredFeed({
+            url: shredUrl || undefined,
+            apiKey: shredApiKey,
+            proxyUrl: shredProxyUrl,
+            udpPort: shredUdpPort,
+            redactUrl,
+            onTx: (address, ev) => this.handleShredTx(address, ev),
+            onChange: () => this.emitStatus(),
+          })
+        : null;
     this.firstSeenBy = new Map();
     this.extraStream = extraStreamUrl
       ? new WalletStream({
@@ -714,6 +731,11 @@ export class SolanaWalletWatcher {
       if (on && all.length) this.grpcFeed.start();
       else this.grpcFeed.stop();
     }
+    if (this.shredFeed) {
+      this.shredFeed.setWallets(all);
+      if (on && all.length) this.shredFeed.start();
+      else this.shredFeed.stop();
+    }
     if (this.extraStream) {
       const normal = all.filter((a) => !flooded.includes(a));
       this.extraStream.setWallets(normal);
@@ -787,8 +809,8 @@ export class SolanaWalletWatcher {
     }
     const w = this.wallets.get(address);
     if (!w) return;
-    // which live feed heard this transaction first (main = Helius, extra = Sodae)
-    if ((this.extraStream || this.grpcFeed) && !this.firstSeenBy.has(ev.signature)) {
+    // which live feed heard this transaction first (main = Helius, extra = Sodae, grpc = Yellowstone, shred = LocalShred)
+    if ((this.extraStream || this.grpcFeed || this.shredFeed) && !this.firstSeenBy.has(ev.signature)) {
       this.firstSeenBy.set(ev.signature, feed);
       if (!ev.err) this.feedRace[feed] = (this.feedRace[feed] || 0) + 1;
       if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
@@ -850,6 +872,37 @@ export class SolanaWalletWatcher {
         this.fastCheck(w, ev.receivedAt || Date.now(), 0, Number.isFinite(ev.slot) ? ev.slot : null);
         return;
       }
+    }
+    this.streamQueue.push({ w, ev });
+    if (this.streamQueue.length > 200) this.streamQueue.splice(0, this.streamQueue.length - 200);
+    this.drainStream();
+  }
+
+  /**
+   * Handle a raw transaction decoded from LocalShred Lite / ShredStream before execution.
+   * If `fastDetect` is enabled and `ev.preParsedSwap` was decoded from the raw instruction bytes,
+   * triggers an immediate pre-execution fast trade (`fastTxTrade`) and verifies confirmation in background.
+   * Otherwise queues the signature to race the confirmation RPCs as soon as the leader executes it.
+   */
+  handleShredTx(address, ev) {
+    if (!ev?.signature) return;
+    const w = this.wallets.get(address);
+    if (!w) return;
+    if (!this.firstSeenBy.has(ev.signature)) {
+      this.firstSeenBy.set(ev.signature, 'shred');
+      this.feedRace.shred = (this.feedRace.shred || 0) + 1;
+      if (this.firstSeenBy.size > 3000) this.firstSeenBy = new Map([...this.firstSeenBy].slice(-1500));
+    }
+    if (this.seenSigs.has(ev.signature)) return;
+    // Ignore transactions where the watched wallet is not a signer (spam / dust transfers)
+    if (Array.isArray(ev.rawTx?.signers) && !ev.rawTx.signers.includes(address)) {
+      this.spamSigs.add(ev.signature);
+      return;
+    }
+    this.streamStats.swapsSeen += 1;
+    if (this.fastDetect() && ev.preParsedSwap && !ev.preParsedSwap.skip) {
+      this.fastTxTrade(w, ev, ev.preParsedSwap);
+      return;
     }
     this.streamQueue.push({ w, ev });
     if (this.streamQueue.length > 200) this.streamQueue.splice(0, this.streamQueue.length - 200);
@@ -1163,6 +1216,7 @@ export class SolanaWalletWatcher {
         ...this.stream.status(),
         extraFeed: this.extraStream ? { name: this.feedRace.extraName, ...this.extraStream.status(), firstMain: this.feedRace.main, firstExtra: this.feedRace.extra } : null,
         grpcFeed: this.grpcFeed ? { ...this.grpcFeed.status(), firstGrpc: this.feedRace.grpc, firstMain: this.feedRace.main } : null,
+        shredFeed: this.shredFeed ? { ...this.shredFeed.status(), firstShred: this.feedRace.shred, firstGrpc: this.feedRace.grpc, firstMain: this.feedRace.main } : null,
         enabled: this.streamEnabled && this.running,
         swapsSeen: this.streamStats.swapsSeen,
         notSwap: this.streamStats.notSwap,
