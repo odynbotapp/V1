@@ -50,6 +50,9 @@ if (!process.env.LOCALSHRED_URL && process.env.LOCALSHRED_API_KEY) {
 if (!process.env.NOZOMI_RPC_URL && process.env.NOZOMI_API_KEY) {
   process.env.NOZOMI_RPC_URL = `http://ams1.nozomi.temporal.xyz/?c=${String(process.env.NOZOMI_API_KEY).trim()}`;
 }
+if (!process.env.ASTRALANE_RPC_URL && process.env.ASTRALANE_API_KEY) {
+  process.env.ASTRALANE_RPC_URL = `http://ams.gateway.astralane.io/iris?api-key=${String(process.env.ASTRALANE_API_KEY).trim()}`;
+}
 const PORT = Number(process.env.PORT || 3400);
 // Hosting platforms (Railway) must reach the server from outside the container
 const ON_RAILWAY = Boolean(
