@@ -103,11 +103,17 @@ function broadcastRaw(obj) {
 // Live wallet watching (signals only — reads public chain data, never trades)
 export const liveSignals = new LiveSignalService({ engine, broadcast: broadcastRaw, alchemy });
 // Live pump.fun & Raydium LaunchLab curve prices / liquidity for open positions (fast RPC when real trade open)
-engine.curveSource = (mints) => {
+engine.curveSource = async (mints) => {
   const open = engine.positions.filter((p) => p.remainingTokens > 0);
   const hasRealOpen = open.some((p) => p.isPaper === false);
   const launchLabMints = new Set(open.filter((p) => p.venue === 'launchlab').map((p) => p.tokenAddress));
-  return fetchPumpCurves((m, p) => liveSignals.watcher.rpc(m, p, { fast: hasRealOpen }), mints, CHAINS.solana.nativePriceUsd, launchLabMints);
+  const res = await fetchPumpCurves((m, p) => liveSignals.watcher.rpc(m, p, { fast: hasRealOpen }), mints, CHAINS.solana.nativePriceUsd, launchLabMints);
+  if (res && typeof liveSignals.watcher.cacheLiveCurve === 'function') {
+    for (const [m, info] of Object.entries(res)) {
+      if (info?.curve && !info.complete) liveSignals.watcher.cacheLiveCurve(m, info.curve);
+    }
+  }
+  return res;
 };
 // Logos / wallet pictures straight from chain data when Alchemy DAS is down (same RPC as Live Signals)
 alchemy.fallback = new OnchainMetadata({ rpc: (method, params) => liveSignals.watcher.rpc(method, params) });
@@ -219,10 +225,11 @@ liveSignals.watcher.onWalletTx = (address, ev) => {
   }
 };
 liveSignals.watcher.syncStreams();
-realTrader.jitoTipLamports = (side, tradeSol) =>
+realTrader.jitoTipLamports = (side, tradeSol, urgent = false) =>
   jitoTipLamportsFor(engine.settings.priorityFee, {
     side,
     tradeSol,
+    urgent,
     hasJito: realTrader.hasJitoEndpoint(),
     envTipLamports: process.env.ODEX_JITO_TIP_LAMPORTS,
     envSellTipLamports: process.env.ODEX_JITO_SELL_TIP_LAMPORTS,

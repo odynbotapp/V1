@@ -437,3 +437,57 @@ test('LS7 Bug #1 & #2 regressions: zero minTokensOut never produces fake $375B M
   assert.equal(watcher.seenSigs.has(nonParsedSig), false, 'non-pre-parsed shred does not lock seenSigs');
   assert.equal(watcher.streamQueue.length, 0, 'non-pre-parsed shred does not queue slow getTransaction poll');
 });
+
+test('LS8 Upgrade #1 & #3: 0-RPC liveCurveCache hit on fastShredTrade and atomic urgent sell Jito tip', async () => {
+  const { jitoTipLamportsFor } = await import('../engine/realTrader.mjs');
+  // Upgrade #1: normal sells keep 0 tip by default; urgent sells (trader sold / stop-loss / floor) get atomic exit tip
+  assert.equal(jitoTipLamportsFor({ mode: 'turbo' }, { side: 'sell', hasJito: true, urgent: false }), 0);
+  assert.equal(jitoTipLamportsFor({ mode: 'turbo' }, { side: 'sell', hasJito: true, urgent: true }), 500_000);
+  assert.equal(jitoTipLamportsFor({ mode: 'fast' }, { side: 'sell', hasJito: true, urgent: true }), 250_000);
+
+  // Upgrade #3: fastShredTrade uses in-memory liveCurveCache (0 RPC calls) when fresh (<=3s)
+  let rpcCount = 0;
+  const signals = [];
+  const watcher = new SolanaWalletWatcher({
+    rpcUrl: 'http://127.0.0.1:9',
+    stream: false,
+    tokenInfo: {
+      cache: new Map(),
+      ttlMs: 60_000,
+      get: async () => null,
+      solPriceFast: async () => 150,
+      solPriceUsd: async () => 150,
+    },
+    onSignal: (s) => signals.push(s),
+  });
+  watcher.fastDetect = () => true;
+  watcher.confirmDelaysMs = [];
+  watcher.rpc = async (method) => {
+    if (method === 'getAccountInfo') rpcCount += 1;
+    return null;
+  };
+  watcher.setWallets([{ address: DECU, label: '@Decu' }]);
+  watcher.cacheLiveCurve(MINT, {
+    virtualSolReserves: 35_000_000_000,
+    virtualTokenReserves: 900_000_000_000_000,
+    realTokenReserves: 600_000_000_000_000,
+    realSolReserves: 5_000_000_000,
+    tokenProgram: TOKEN_2022_PROGRAM,
+  });
+
+  const buyIx = buyExactQuoteInIx({
+    user: DECU,
+    mint: MINT,
+    baseTokenProgram: TOKEN_2022_PROGRAM,
+    lamportsIn: 2_000_000_000n,
+    minTokensOut: 0n,
+  });
+  const { rawBytes, signature } = buildRawLegacyTx({ payer: DECU, instructions: [buyIx] });
+  const { tx } = decodeVersionedTransactionAt(rawBytes, 0);
+  const preSwap = extractSwapFromRawTx(tx, DECU, { slot: 465_700_000 });
+
+  await watcher.fastShredTrade(watcher.wallets.get(DECU), { signature, slot: 465_700_000, receivedAt: Date.now() }, preSwap);
+  assert.equal(rpcCount, 0, '0 getAccountInfo RPC calls when liveCurveCache has fresh reserves');
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].curve?.virtualSolReserves, 37_000_000_000);
+});

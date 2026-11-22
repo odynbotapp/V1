@@ -578,6 +578,7 @@ export class SolanaWalletWatcher {
     this.onPhantomTrade = null; // ({ signature, wallet, side, mint, reason }) → close the copy
     this.onWalletTx = null; // optional hook (address, ev) when a full pushed tx arrives
     this.pumpSwapPoolCache = new Map(); // pool pubkey -> { baseMint, quoteMint, decimals }
+    this.liveCurveCache = new Map(); // mint -> { virtualQuoteReserves, virtualTokenReserves, realTokenReserves, realQuoteReserves, isMayhem, isCashback, solPaired, complete, tokenProgram, at }
     this.fastStats = { hits: 0, misses: 0, forged: 0, confirmed: 0, phantoms: 0, missReasons: {}, lagMs: [], lastPhantom: null };
     this.confirmDelaysMs = [1500, 2500, 4000, 6000, 10_000, 15_000, 20_000];
     this.stream = new WalletStream({
@@ -909,11 +910,36 @@ export class SolanaWalletWatcher {
     this.fastShredTrade(w, ev, ev.preParsedSwap);
   }
 
+  /** Cache verified Pump.fun bonding-curve reserves in memory (<=3s TTL) for 0-RPC fastShredTrade. */
+  cacheLiveCurve(mint, curve) {
+    if (!mint || !curve) return;
+    const vSol = BigInt(Math.round(Number(curve.virtualQuoteReserves ?? curve.virtualSolReserves ?? 0)));
+    const vTok = BigInt(Math.round(Number(curve.virtualTokenReserves ?? 0)));
+    if (vSol <= 0n || vTok <= 0n || curve.complete || curve.launchlab || curve.solPaired === false) return;
+    if (!this.liveCurveCache) this.liveCurveCache = new Map();
+    if (this.liveCurveCache.size > 1000) {
+      this.liveCurveCache = new Map([...this.liveCurveCache].slice(-500));
+    }
+    this.liveCurveCache.set(mint, {
+      virtualQuoteReserves: vSol,
+      virtualTokenReserves: vTok,
+      realTokenReserves: BigInt(Math.round(Number(curve.realTokenReserves ?? 0))),
+      realQuoteReserves: BigInt(Math.round(Number(curve.realQuoteReserves ?? curve.realSolReserves ?? 0))),
+      isMayhem: Boolean(curve.isMayhem ?? curve.mayhem),
+      isCashback: Boolean(curve.isCashback ?? curve.cashback),
+      solPaired: true,
+      complete: false,
+      tokenProgram: curve.tokenProgram || null,
+      at: Date.now(),
+    });
+  }
+
   /**
    * Fast path for a pre-execution Pump.fun swap decoded from LocalShred raw instructions.
-   * Reads the live on-chain bonding curve (`processed`) in 1 fast RPC call (~15-20ms) to compute the
-   * true post-trader virtual reserves and exact fill price (never using `minTokensOut` slippage floor
-   * as `traderFillPriceUsd` or `marketCapUsd`), then triggers `fastTxTrade` with real curve reserves
+   * Uses the 0-RPC in-memory liveCurveCache when fresh (<=3s), otherwise reads the live on-chain
+   * bonding curve (`processed`) in 1 fast RPC call (~15-20ms) to compute the true post-trader
+   * virtual reserves and exact fill price (never using `minTokensOut` slippage floor as
+   * `traderFillPriceUsd` or `marketCapUsd`), then triggers `fastTxTrade` with real curve reserves
    * so `RealTrader.directQuote` hits its 0-RPC `fastCurve` path and blasts in parallel immediately.
    */
   async fastShredTrade(w, ev, preSwap) {
@@ -921,10 +947,17 @@ export class SolanaWalletWatcher {
     if (this.seenSigs.has(sig)) return null;
     const swap = { ...preSwap, curve: preSwap.curve ? { ...preSwap.curve } : null };
     try {
-      const pda = bondingCurvePda(swap.tokenMint);
-      const acc = await this.rpc('getAccountInfo', [pda, { encoding: 'base64', commitment: 'processed' }], { fast: true });
-      if (this.seenSigs.has(sig)) return null; // Yellowstone gRPC already beat us with exact post-tx reserves
-      const curve = acc?.value?.data?.[0] ? decodeCurve(acc.value.data[0]) : null;
+      const cached = this.liveCurveCache?.get(swap.tokenMint);
+      let curve = cached && Date.now() - cached.at <= 3000 ? cached : null;
+      if (!curve) {
+        const pda = bondingCurvePda(swap.tokenMint);
+        const acc = await this.rpc('getAccountInfo', [pda, { encoding: 'base64', commitment: 'processed' }], { fast: true });
+        if (this.seenSigs.has(sig)) return null; // Yellowstone gRPC already beat us with exact post-tx reserves
+        curve = acc?.value?.data?.[0] ? decodeCurve(acc.value.data[0]) : null;
+        if (curve && !curve.complete && curve.solPaired) {
+          this.cacheLiveCurve(swap.tokenMint, { ...curve, tokenProgram: swap.curve?.tokenProgram || null });
+        }
+      }
       if (curve && !curve.complete && curve.solPaired && curve.virtualQuoteReserves > 0n && curve.virtualTokenReserves > 0n) {
         if (swap.side === 'buy') {
           const lamportsIn = BigInt(Math.round(swap.quoteAmount * LAMPORTS_PER_SOL));
@@ -1722,6 +1755,9 @@ export class SolanaWalletWatcher {
     };
     this.emittedSigs.set(sig, swap.tokenMint);
     if (this.emittedSigs.size > 3000) this.emittedSigs = new Map([...this.emittedSigs].slice(-1500));
+    if (signal.curve && Number(signal.curve.virtualSolReserves) > 0 && Number(signal.curve.virtualTokenReserves) > 0) {
+      this.cacheLiveCurve(swap.tokenMint, signal.curve);
+    }
     w.lastMoveAt = Date.now();
     this.status.signalsEmitted += 1;
     try {

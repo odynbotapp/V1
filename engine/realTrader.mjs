@@ -70,7 +70,7 @@ export function priorityMicroLamportsFor(priorityFee, cuUnits = 100_000, envOver
  * Transferred via SystemProgram.transfer inside the swap tx (+ `?bundleOnly=true`), so if a swap
  * reverts (e.g. 6042 price ceiling) the tip rolls back to 0 SOL.
  */
-export function jitoTipLamportsFor(priorityFee, { side = 'buy', tradeSol = null, hasJito = false, envTipLamports = null, envSellTipLamports = null } = {}) {
+export function jitoTipLamportsFor(priorityFee, { side = 'buy', tradeSol = null, hasJito = false, envTipLamports = null, envSellTipLamports = null, urgent = false } = {}) {
   if (!hasJito) return 0;
   if (side === 'sell') {
     if (envSellTipLamports !== null && envSellTipLamports !== undefined && String(envSellTipLamports).trim() !== '') {
@@ -79,6 +79,11 @@ export function jitoTipLamportsFor(priorityFee, { side = 'buy', tradeSol = null,
         const n = Math.max(0, Math.floor(ov));
         return n >= 1_000 ? n : 0;
       }
+    }
+    if (urgent) {
+      const mode = String(priorityFee?.mode || 'normal').toLowerCase();
+      if (mode === 'turbo') return 500_000; // 0.0005 SOL atomic exit tip on turbo urgent sells (prevents -20% crash slippage)
+      if (mode === 'fast' || mode === 'custom') return 250_000; // 0.00025 SOL atomic exit tip
     }
     return 0;
   }
@@ -1092,7 +1097,7 @@ export class RealTrader {
    * { ok, signature, exec, inAmount, sendMs } | { priceMoved } | { unknown, signature } | { fallback, error }
    * `fallback` always means NOTHING was sent, so Jupiter can safely be used instead.
    */
-  async executeDirect({ side, token, quote, slippagePct, tooLate = () => false }) {
+  async executeDirect({ side, token, quote, slippagePct, tooLate = () => false, urgent = false }) {
     const d = quote._direct;
     const mint = token.address;
     const slip = Number.isFinite(slippagePct) && slippagePct > 0 ? slippagePct : side === 'sell' ? 15 : 10;
@@ -1114,7 +1119,7 @@ export class RealTrader {
       const microLamports = this.priorityMicroLamports(units, side, tradeSol);
       priorityLamports = Math.ceil((units * Math.max(0, Number(microLamports) || 0)) / 1_000_000);
       {
-        const rawTip = Math.max(0, Math.floor(Number(this.jitoTipLamports?.(side, tradeSol) || 0)));
+        const rawTip = Math.max(0, Math.floor(Number(this.jitoTipLamports?.(side, tradeSol, urgent) || 0)));
         tipLamports = BigInt(rawTip >= 1_000 ? rawTip : 0);
         if (tipLamports > 0n && d.preLamports !== undefined) {
           const spendNeed = side === 'buy' ? d.lamportsIn : 0n;
@@ -1643,7 +1648,7 @@ export class RealTrader {
     let directNote = null;
     if (tooLate()) return release(this.fail(lateError(), { late: true }));
     if (quote?._direct && quote._side === side && this.now() - quote.timestamp < 6000) {
-      const dr = await this.executeDirect({ side, token, quote, slippagePct, tooLate });
+      const dr = await this.executeDirect({ side, token, quote, slippagePct, tooLate, urgent });
       if (dr.ok) {
         exec = dr.exec;
         signature = dr.signature;
