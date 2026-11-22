@@ -118,6 +118,28 @@ export function restoreEngine(engine, data) {
         f.tpPct = null;
         f.decuV12Migrated = true;
       }
+      if (!f.followTraderV13Migrated) {
+        const isDecu = f.id === 'fol-03782071' || f.id === 'fol-061e3abc' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9';
+        f.mode = 'auto-exit';
+        f.mirrorSells = true;
+        f.slPct = null;
+        f.tpPct = null;
+        if (!isDecu) {
+          f.maxChasePct = f.maxChasePct && f.maxChasePct <= 35 ? f.maxChasePct : 35;
+          f.matureMaxChasePct = 26.5;
+          f.freshMcMaxUsd = 15000;
+          const baseRules = followTraderExitRules();
+          f.exitRules = {
+            ...baseRules,
+            takeInitials: { ...baseRules.takeInitials, enabled: true, takeAtPct: 25, sellSizePct: 100 },
+            moonbagTrail: { ...baseRules.moonbagTrail, enabled: false, trailPct: 20, armsAtPct: 15 },
+            floor: { ...baseRules.floor, enabled: true, openingFloorPct: 40, tightensAfterSec: 3600, tightFloorPct: 40, graceSec: 4 },
+            waveCut: { ...baseRules.waveCut, enabled: false, afterSec: 90, needsPeakPct: 5 },
+            hardTimeCap: { ...baseRules.hardTimeCap, enabled: true, timeCapSec: 300 },
+          };
+        }
+        f.followTraderV13Migrated = true;
+      }
     }
   }
   if (Array.isArray(data.positions)) engine.positions = data.positions;

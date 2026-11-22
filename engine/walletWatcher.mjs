@@ -1632,7 +1632,13 @@ export class SolanaWalletWatcher {
                 tokenProgram: swap.curve.tokenProgram || null,
                 at: swap.curve.at || Date.now(),
               }
-            : null,
+            : swap.preExecution && swap.curve
+              ? {
+                  preExecution: true,
+                  tokenProgram: swap.curve.tokenProgram || null,
+                  at: swap.curve.at || Date.now(),
+                }
+              : null,
       signature: sig,
       explorerUrl: `https://solscan.io/tx/${sig}`,
       blockTime: swap.blockTime,

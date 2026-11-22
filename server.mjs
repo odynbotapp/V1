@@ -1507,11 +1507,21 @@ export const server = http.createServer(async (req, res) => {
             hardTimeCap: { ...follow.exitRules.hardTimeCap, ...(body.exitRules.hardTimeCap || {}) },
           });
         }
-        // per-trader overrides: max chase (null = account setting) and copying top-ups
+        // per-trader overrides: max chase (null = account setting), mature max chase, fresh MC threshold, and copying top-ups
         if (body.maxChasePct !== undefined) {
           const v = body.maxChasePct === null || body.maxChasePct === '' ? null : Number(body.maxChasePct);
           if (v !== null && !(Number.isFinite(v) && v >= 1 && v <= 100000)) return sendJson(res, 400, { ok: false, error: 'Max chase must be between 1% and 100000%.' });
           follow.maxChasePct = v;
+        }
+        if (body.matureMaxChasePct !== undefined) {
+          const v = body.matureMaxChasePct === null || body.matureMaxChasePct === '' ? null : Number(body.matureMaxChasePct);
+          if (v !== null && !(Number.isFinite(v) && v >= 1 && v <= 100000)) return sendJson(res, 400, { ok: false, error: 'Mature max chase must be between 1% and 100000%.' });
+          follow.matureMaxChasePct = v;
+        }
+        if (body.freshMcMaxUsd !== undefined) {
+          const v = body.freshMcMaxUsd === null || body.freshMcMaxUsd === '' ? null : Number(body.freshMcMaxUsd);
+          if (v !== null && !(Number.isFinite(v) && v > 0 && v <= 1e9)) return sendJson(res, 400, { ok: false, error: 'Fresh market cap threshold must be above $0.' });
+          follow.freshMcMaxUsd = v;
         }
         if (body.copyTopUps !== undefined) follow.copyTopUps = body.copyTopUps === null || body.copyTopUps === '' ? null : Boolean(body.copyTopUps);
         // re-entry rule: minutes after our copy of a coin closed during which the trader's new buys of

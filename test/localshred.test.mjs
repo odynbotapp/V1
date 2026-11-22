@@ -361,6 +361,7 @@ test('LS6 Proxy gRPC SubscribeEntries stream + SolanaWalletWatcher pre-execution
   assert.equal(signals[0].side, 'buy');
   assert.equal(signals[0].tokenMint, MINT);
   assert.equal(signals[0].quoteAmount, 3);
+  assert.equal(signals[0].curve?.preExecution, true, 'signal preserves curve.preExecution for parallel fastCurve blast');
   assert.equal(watcher.feedRace.shred, 1);
   assert.equal(watcher.getStatus().stream.shredFeed.firstShred, 1);
 

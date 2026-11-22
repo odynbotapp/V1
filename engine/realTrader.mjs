@@ -1046,7 +1046,7 @@ export class RealTrader {
         : Number.isInteger(token?.curve?.slot) && token.curve.slot > 0
           ? token.curve.slot
           : null;
-    const d = { curve, baseTokenProgram, userAta, ataExists, preTokens, preLamports, fastCurve: Boolean(fastTc), tokDec, blockhash, traderSlot };
+    const d = { curve, baseTokenProgram, userAta, ataExists, preTokens, preLamports, fastCurve: Boolean(fastTc || token?.curve?.preExecution), tokDec, blockhash, traderSlot };
     if (side === 'buy') {
       const lamportsIn = BigInt(Math.floor((amountUsd / px) * 1e9));
       const tokensOut = PD.quoteBuy(curve, lamportsIn);
