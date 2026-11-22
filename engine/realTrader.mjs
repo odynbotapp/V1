@@ -1164,8 +1164,10 @@ export class RealTrader {
           if (kind === primaryKind) continue;
           const pool = PD.RELAY_TIP_ACCOUNTS[kind];
           if (!pool?.length) continue;
+          // Nozomi (Temporal) enforces a 0.001 SOL (1,000,000 lamports) minimum tip; clamp its variant tip so it never gets rejected
+          const relayTip = kind === 'nozomi' && tipLamports < 1_000_000n ? 1_000_000n : tipLamports;
           const tipTo = pool[Math.floor(Math.random() * pool.length)];
-          const vIxs = [...d._coreIxs, PD.systemTransferIx({ from: this.address, to: tipTo, lamports: tipLamports })];
+          const vIxs = [...d._coreIxs, PD.systemTransferIx({ from: this.address, to: tipTo, lamports: relayTip })];
           const { message: vMsg } = PD.compileMessage({ payer: this.address, instructions: vIxs, recentBlockhash: blockhash });
           const vSigned = PD.signLegacy(vMsg, this.keypair);
           variantByRelay.set(kind, vSigned.base64);

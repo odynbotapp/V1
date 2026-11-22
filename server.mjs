@@ -47,6 +47,9 @@ if (!process.env.LOCALSHRED_API_KEY && process.env.LOCALSHRED_KEY) {
 if (!process.env.LOCALSHRED_URL && process.env.LOCALSHRED_API_KEY) {
   process.env.LOCALSHRED_URL = 'http://localshred-lite.nlams.dedicatednodes.io:9999';
 }
+if (!process.env.NOZOMI_RPC_URL && process.env.NOZOMI_API_KEY) {
+  process.env.NOZOMI_RPC_URL = `http://ams1.nozomi.temporal.xyz/?c=${String(process.env.NOZOMI_API_KEY).trim()}`;
+}
 const PORT = Number(process.env.PORT || 3400);
 // Hosting platforms (Railway) must reach the server from outside the container
 const ON_RAILWAY = Boolean(
