@@ -646,7 +646,7 @@ export class RealTrader {
   }
 
   /** Keep a fresh recentBlockhash in memory so direct pump.fun quotes never wait on getLatestBlockhash. */
-  startBlockhashWarmer(intervalMs = 10_000) {
+  startBlockhashWarmer(intervalMs = 3_000) {
     if (this.blockhashTimer) return;
     const tick = () => {
       if (!this.ready() || this.routeSetting() !== 'direct') return;
