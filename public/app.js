@@ -133,11 +133,10 @@ window.switchMainView = function switchMainView(viewId) {
 
 let currentTermTab = 'positions';
 window.switchTermTab = function switchTermTab(tabId) {
-  // Copytrades and Settings & Risk now live in the Settings page
-  if (tabId === 'follows' || tabId === 'settings') {
-    const section = tabId === 'follows' ? 'copytrades' : 'trading';
+  // Settings & Risk lives in the Settings page; Copytrades (`follows`) is its own standalone left-menu panel
+  if (tabId === 'settings') {
     tabId = 'config';
-    setTimeout(() => openSettingsSection(section), 0);
+    setTimeout(() => openSettingsSection('trading'), 0);
   }
   currentTermTab = tabId;
   document.querySelectorAll('.term-panel').forEach((el) => el.classList.remove('active'));
@@ -1660,6 +1659,22 @@ function trendCircle(v) {
   return `<span class="trend-circle ${up ? 'is-up' : 'is-down'}" aria-label="${up ? 'up' : 'down'}"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${up ? '<path d="M12 19V5M5 12l7-7 7 7"/>' : '<path d="M12 5v14M19 12l-7 7-7-7"/>'}</svg></span>`;
 }
 
+const expandedFollowIds = new Set();
+
+window.toggleFollowRow = function toggleFollowRow(id) {
+  if (!id) return;
+  if (expandedFollowIds.has(id)) expandedFollowIds.delete(id);
+  else expandedFollowIds.add(id);
+  renderFollowsList();
+};
+
+function fmtCompactRisk(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n >= 1000) return `$${Number((n / 1000).toFixed(n % 1000 === 0 ? 0 : 1))}k risk`;
+  return `$${n} risk`;
+}
+
 function renderFollowsList() {
   const followsDateLabel = document.getElementById('follows-date-filter-label');
   if (followsDateLabel) followsDateLabel.textContent = dateFilterText();
@@ -1682,67 +1697,137 @@ function renderFollowsList() {
     return;
   }
 
-  setHtml(container, engineState.follows
+  const cfg = { autoPause: true, minTrades: 10, maxSlipPct: 20, maxLagSec: 10, ...(engineState.settings.scorecard || {}) };
+  const pct = (v, signed = true) => (v === null || v === undefined ? '—' : `${signed && v > 0 ? '+' : ''}${Number(v).toFixed(1)}%`);
+  const periodLabel = dateFilterText();
+  const modeLabel = engineState.settings.paperTrading ? 'Paper' : 'Real';
+
+  const rowsHtml = engineState.follows
     .map((f) => {
       const isCopying = f.status === 'copying';
-      const sizeText =
+      const isExpanded = expandedFollowIds.has(f.id);
+      const sizeChip =
         f.sizing.type === 'fixed'
-          ? `$${f.sizing.amount} per trade`
+          ? `$${f.sizing.amount}/trade`
           : f.sizing.type === 'percent'
-            ? `${f.sizing.amount}% of balance`
-            : `1:1 proportional (cap $${f.sizing.amount})`;
-      const tpslText = `${f.tpPct ? `TP +${f.tpPct}%` : 'No TP'} · ${f.slPct ? `SL −${f.slPct}%` : 'No SL'}`;
+            ? `${f.sizing.amount}% bal`
+            : `1:1 cap $${f.sizing.amount}`;
+      const modeText = f.mode === 'auto-exit' ? 'Auto exit' : f.mode === 'buy-and-hold' ? 'Buy & hold' : 'Mirror';
+      const tpslChip = f.tpPct || f.slPct
+        ? `${f.tpPct ? `TP +${f.tpPct}%` : 'No TP'}/${f.slPct ? `SL −${f.slPct}%` : 'No SL'}`
+        : 'No TP/SL';
+      const limitsChip = [
+        f.maxOpenPositions != null ? `≤${f.maxOpenPositions} open` : '',
+        f.maxAtRiskUsd != null ? fmtCompactRisk(f.maxAtRiskUsd) : '',
+      ].filter(Boolean).join(' · ');
       const activeExitCount = Object.values(f.exitRules || {}).filter((r) => r && r.enabled).length;
       const openCount = engineState.positions.filter((p) => (p.followId === f.id || (f.traderWallet && p.traderWallet === f.traderWallet)) && p.remainingTokens > 0 && (dateFilterState.preset === 'all' || inDateFilter(p.openedAt))).length;
       const histCount = engineState.history.filter((h) => (h.followId === f.id || traderWalletOf(h) === f.traderWallet) && inDateFilter(h.timestamp)).length;
       const sigCount = (liveWatch?.signals || []).filter((x) => x.wallet === f.traderWallet && !x.backfill && inDateFilter(x.blockTime || x.detectedAt)).length;
-      const sc = traderScoreForFilter(f);
+      const sc = traderScoreForFilter(f) || { trades: 0, wins: 0, losses: 0, winRatePct: null, pnlUsd: 0, avgHoldSec: null, avgEntrySlipPct: null, avgExitSlipPct: null, roundTripSlipPct: null, avgLagSec: null, measuredExits: 0, losingStreak: 0 };
       const streakVal = dateFilterState.preset === 'all' ? (f.consecutiveLosses || 0) : (sc?.losingStreak ?? 0);
       const slow = f.pauseReason === 'slow';
+      const winText = sc.winRatePct === null ? '—' : `${sc.winRatePct.toFixed(0)}%`;
+      const pnlText = sc.trades ? `${sc.pnlUsd >= 0 ? '+' : '−'}$${Math.abs(sc.pnlUsd).toFixed(2)}` : '—';
+      const pnlCls = sc.trades ? (sc.pnlUsd > 0 ? 'pos-up' : sc.pnlUsd < 0 ? 'pos-down' : '') : '';
+      const slipBad = sc.roundTripSlipPct !== null && sc.roundTripSlipPct > cfg.maxSlipPct;
+      const lagBad = sc.avgLagSec !== null && sc.avgLagSec > cfg.maxLagSec;
+      const statusSummary = slow
+        ? `Paused: ${esc(f.pauseDetail || "can't keep up")}`
+        : !sc.trades
+          ? `${modeLabel} · no closed copies ${dateFilterState.preset === 'all' ? 'yet' : dateFilterPhrase()}`
+          : `${modeLabel} · ${sc.trades} closed ${sc.trades === 1 ? 'copy' : 'copies'}`;
 
-      return `
-        <div class="follow-card ${isCopying ? '' : 'is-paused'}" data-follow="${f.id}">
-          <div class="follow-head">
-            <div class="follow-identity">
-              ${walletAvatar(f.traderWallet, f.name || f.handle, 44)}
-              <div>
-                <div class="follow-name-row">
-                  <strong class="follow-name">${esc(f.name)}</strong>
-                  <span class="status-pill ${isCopying ? 'status-copying' : 'status-paused'}">${isCopying ? 'Copying' : slow ? "Paused · can't keep up" : 'Paused'}</span>${f.copyTopUps === true && Number(f.maxChasePct) >= 1000 ? '<span class="status-pill status-copyall" title="No price-chase limit, top-ups copied">Copy every trade</span>' : ''}
-                  ${chainBadgeHtml(f.chainId)}
-                </div>
-                <div class="follow-sub mono"><a href="https://solscan.io/account/${encodeURIComponent(f.traderWallet)}" target="_blank" rel="noopener" title="${f.traderWallet}">${f.traderWallet.slice(0, 6)}…${f.traderWallet.slice(-6)}</a> · copies real swaps</div>
+      const pauseIcon = isCopying
+        ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>'
+        : '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="7 5 19 12 7 19 7 5"/></svg>';
+      const settingsIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="10" cy="18" r="2" fill="currentColor"/></svg>';
+      const chevIcon = isExpanded
+        ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>'
+        : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+
+      const drawerHtml = isExpanded ? `
+          <div class="follow-drawer">
+            <div class="follow-drawer-score">
+              <div class="fd-metric"><span>Win rate</span><strong class="mono">${winText}</strong><em>${sc.wins}W · ${sc.losses}L</em></div>
+              <div class="fd-metric"><span>Copy PnL</span><strong class="mono ${pnlCls}">${pnlText}</strong><em>${sc.trades} trade${sc.trades === 1 ? '' : 's'}</em></div>
+              <div class="fd-metric"><span>Avg hold</span><strong class="mono">${fmtHold(sc.avgHoldSec)}</strong><em>per trade</em></div>
+              <div class="fd-metric" title="How much higher our copies bought than the trader did"><span>Entry slip</span><strong class="mono">${pct(sc.avgEntrySlipPct)}</strong><em>vs trader buy</em></div>
+              <div class="fd-metric" title="Mirror sells: our sell price vs the trader's"><span>Exit slip</span><strong class="mono">${pct(sc.avgExitSlipPct)}</strong><em>${sc.measuredExits ? `${sc.measuredExits} mirror sell${sc.measuredExits === 1 ? '' : 's'}` : 'no mirror sells'}</em></div>
+              <div class="fd-metric ${slipBad ? 'is-bad' : ''}" title="Entry slip minus exit slip"><span>Total slip</span><strong class="mono">${pct(sc.roundTripSlipPct)}</strong><em>limit ${cfg.maxSlipPct}%</em></div>
+              <div class="fd-metric ${lagBad ? 'is-bad' : ''}" title="Seconds between trader's trade landing and our copy"><span>Detect delay</span><strong class="mono">${sc.avgLagSec === null ? '—' : `${sc.avgLagSec.toFixed(1)}s`}</strong><em>limit ${cfg.maxLagSec}s</em></div>
+            </div>
+            ${f.mode === 'auto-exit' && activeExitCount === 0 ? `<div class="follow-warn">
+              <span><strong>No exit rules are on.</strong> In Auto-Exit mode nothing sells automatically, and the trader's sells aren't copied either.</span>
+              <button type="button" class="btn btn-sm btn-primary" onclick="event.stopPropagation(); useRecommendedExits('${f.id}')">Turn on recommended exits</button>
+            </div>` : ''}
+            <div class="follow-drawer-foot">
+              <div class="follow-drawer-links">
+                <button type="button" class="fd-pill" onclick="event.stopPropagation(); filterByTrader('${f.traderWallet}', 'positions')">Positions <span class="mono">${openCount}</span></button>
+                <button type="button" class="fd-pill" onclick="event.stopPropagation(); filterByTrader('${f.traderWallet}', 'signals')">Live signals <span class="mono">${sigCount}</span></button>
+                <button type="button" class="fd-pill" onclick="event.stopPropagation(); filterByTrader('${f.traderWallet}', 'history')">Trade history <span class="mono">${histCount}</span></button>
+              </div>
+              <div class="follow-drawer-right">
+                <span class="fd-meta-txt">${statusSummary} · losing streak ${streakVal}</span>
+                <button type="button" class="fd-pill fd-pill-exit" onclick="event.stopPropagation(); openExitRulesModal('${f.id}')">Exit rules <span class="mono">${activeExitCount}/5</span></button>
+                <button type="button" class="fd-pill fd-pill-danger" onclick="event.stopPropagation(); removeFollow('${f.id}')">Remove</button>
               </div>
             </div>
-            <div class="card-actions">
-              <button class="btn btn-sm" onclick="toggleFollowStatus('${f.id}', '${isCopying ? 'paused' : 'copying'}')">${isCopying ? 'Pause' : 'Resume'}</button>
-              <button class="btn btn-sm" onclick="openEditFollowModal('${f.id}')">Settings</button>
-              <button class="btn btn-indigo-soft btn-sm" onclick="openExitRulesModal('${f.id}')">Exit rules <span class="mono rule-count">${activeExitCount}/5</span></button>
-              <button class="btn btn-ghost-danger btn-sm" onclick="removeFollow('${f.id}')">Remove</button>
+          </div>` : '';
+
+      return `
+        <div class="follow-row-wrap ${isExpanded ? 'is-expanded' : ''} ${isCopying ? '' : 'is-paused'}" data-follow="${f.id}">
+          <div class="follow-row" onclick="toggleFollowRow('${f.id}')" role="button" tabindex="0">
+            <div class="fr-col fr-trader">
+              ${walletAvatar(f.traderWallet, f.name || f.handle, 34)}
+              <div class="fr-trader-txt">
+                <div class="fr-name-line">
+                  <strong class="fr-name">${esc(f.name)}</strong>
+                  <span class="fr-dot ${isCopying ? 'is-on' : 'is-off'}" title="${isCopying ? 'Copying' : slow ? "Paused · can't keep up" : 'Paused'}"></span>
+                  <span class="fr-chain">${f.chainId === 'solana' ? 'SOL' : esc(String(f.chainId || 'SOL').toUpperCase())}</span>
+                </div>
+                <a class="fr-addr mono" href="https://solscan.io/account/${encodeURIComponent(f.traderWallet)}" target="_blank" rel="noopener" title="${f.traderWallet}" onclick="event.stopPropagation()">${f.traderWallet.slice(0, 6)}…${f.traderWallet.slice(-6)}</a>
+              </div>
+            </div>
+            <div class="fr-col fr-setup">
+              <div class="fr-chips">
+                <span class="fr-chip">${esc(sizeChip)}</span>
+                <span class="fr-chip">${esc(modeText)}</span>
+                <span class="fr-chip">${esc(tpslChip)}</span>
+              </div>
+              ${limitsChip ? `<div class="fr-chips"><span class="fr-chip fr-chip-sub">${esc(limitsChip)}</span></div>` : ''}
+            </div>
+            <div class="fr-col fr-num mono">${winText}</div>
+            <div class="fr-col fr-num mono ${pnlCls}">${pnlText}</div>
+            <div class="fr-col fr-num mono">${openCount}</div>
+            <div class="fr-col fr-num mono">${sigCount}</div>
+            <div class="fr-col fr-actions" onclick="event.stopPropagation()">
+              <button type="button" class="fr-icon-btn" onclick="toggleFollowStatus('${f.id}', '${isCopying ? 'paused' : 'copying'}')" title="${isCopying ? 'Pause copying' : 'Resume copying'}">${pauseIcon}</button>
+              <button type="button" class="fr-icon-btn" onclick="openEditFollowModal('${f.id}')" title="Trader settings">${settingsIcon}</button>
+              <button type="button" class="fr-icon-btn ${isExpanded ? 'is-active' : ''}" onclick="toggleFollowRow('${f.id}')" title="${isExpanded ? 'Collapse details' : 'Expand details'}">${chevIcon}</button>
             </div>
           </div>
-
-          <div class="follow-meta-grid">
-            <div class="meta-item"><span>Exit mode</span><strong>${f.mode.replace(/-/g, ' ')}</strong></div>
-            <div class="meta-item"><span>Sizing</span><strong class="mono">${sizeText}</strong></div>
-            <div class="meta-item"><span>TP / SL</span><strong class="mono">${tpslText}</strong></div>
-            <div class="meta-item"><span>Limits</span><strong class="mono">${[f.minTradeUsd != null ? `Min $${f.minTradeUsd}` : '', f.maxOpenPositions != null ? `${f.maxOpenPositions} open max` : '', f.maxAtRiskUsd != null ? `$${Number(f.maxAtRiskUsd).toLocaleString()} at risk` : ''].filter(Boolean).join(' · ') || 'None set'}</strong></div>
-            <div class="meta-item"><span>Losing streak</span><strong class="mono ${streakVal > 0 ? 'pos-down' : ''}">${streakVal}</strong></div>
-          </div>
-          ${traderScoreHtml(f)}
-          ${f.mode === 'auto-exit' && activeExitCount === 0 ? `<div class="follow-warn">
-            <span><strong>No exit rules are on.</strong> In Auto-Exit mode nothing sells automatically, and the trader's sells aren't copied either.</span>
-            <button type="button" class="btn btn-sm btn-primary" onclick="useRecommendedExits('${f.id}')">Turn on recommended exits</button>
-          </div>` : ''}
-          <div class="follow-links">
-            <button type="button" class="link-chip" onclick="filterByTrader('${f.traderWallet}', 'positions')">Positions <span class="mono">${openCount}</span></button>
-            <button type="button" class="link-chip" onclick="filterByTrader('${f.traderWallet}', 'signals')">Live signals <span class="mono">${sigCount}</span></button>
-            <button type="button" class="link-chip" onclick="filterByTrader('${f.traderWallet}', 'history')">Trade history <span class="mono">${histCount}</span></button>
-          </div>
-        </div>
-      `;
+          ${drawerHtml}
+        </div>`;
     })
-    .join(''));
+    .join('');
+
+  setHtml(container, `
+    <div class="follows-table-head">
+      <span>TRADER</span>
+      <span>SETUP</span>
+      <span class="fr-num">WIN</span>
+      <span class="fr-num">PNL</span>
+      <span class="fr-num">OPEN</span>
+      <span class="fr-num">SIGNALS</span>
+      <span class="fr-num">ACTIONS</span>
+    </div>
+    <div class="follows-table-body">${rowsHtml}</div>
+    <div class="follows-table-foot">
+      <span>Scorecards: ${esc(periodLabel)} · ${engineState.settings.paperTrading ? 'paper' : 'real'}</span>
+      <span>Copying real swaps on all wallets</span>
+    </div>
+  `);
 }
 
 function renderWalletsList() {
@@ -3867,9 +3952,7 @@ function syncSideSubnav() {
   document.querySelectorAll('.side-nav .nav-tab').forEach((b) => {
     const panel = b.getAttribute('data-panel');
     const view = b.getAttribute('data-view');
-    if (panel === 'follows') b.classList.toggle('active', Boolean(onTerminal && tab === 'config' && currentCfgSection === 'copytrades'));
-    else if (panel === 'config') b.classList.toggle('active', Boolean(onTerminal && tab === 'config' && currentCfgSection !== 'copytrades'));
-    else if (panel) b.classList.toggle('active', Boolean(onTerminal && tab === panel));
+    if (panel) b.classList.toggle('active', Boolean(onTerminal && tab === panel));
     else if (view === 'terminal') b.classList.toggle('active', Boolean(onTerminal && !SIDEBAR_PANELS.includes(tab)));
   });
   document.querySelectorAll('.nav-sub').forEach((b) => {
@@ -3881,7 +3964,6 @@ function syncSideSubnav() {
 window.goTerminalTab = function goTerminalTab(tab) {
   if (tab === 'config') {
     setTimeout(() => window.refreshRealPanel?.(), 0);
-    if (!routeApplying && currentCfgSection === 'copytrades') setTimeout(() => openSettingsSection('profile'), 0);
   }
   // one address change per click: the view switch below must not record its own step
   const wasApplying = typeof routeApplying !== 'undefined' && routeApplying;
@@ -4390,7 +4472,7 @@ window.clearHistory = async function clearHistory() {
 // ============================================================================
 // Settings page (left menu): sections + profile / security / notification prefs
 // ============================================================================
-let currentCfgSection = 'copytrades';
+let currentCfgSection = 'profile';
 let landingApplied = false;
 
 function uiPrefs() {
@@ -4404,7 +4486,7 @@ function fmtDateTime(ts) {
 }
 
 window.openSettingsSection = function openSettingsSection(key) {
-  if (!document.querySelector(`.cfg-section[data-cfg="${key}"]`)) key = 'copytrades';
+  if (!document.querySelector(`.cfg-section[data-cfg="${key}"]`)) key = 'profile';
   currentCfgSection = key;
   document.querySelectorAll('.cfg-section').forEach((el) => el.classList.toggle('active', el.dataset.cfg === key));
   document.querySelectorAll('.cfg-nav-btn').forEach((el) => el.classList.toggle('active', el.dataset.cfg === key));
@@ -4690,9 +4772,11 @@ window.useRecommendedExits = async function useRecommendedExits(id) {
 
 window.openTrader = function openTrader(wallet) {
   const f = followForWallet(wallet);
+  if (f) expandedFollowIds.add(f.id);
   goTerminalTab('follows');
+  renderFollowsList();
   setTimeout(() => {
-    const el = f && document.querySelector(`.follow-card[data-follow="${f.id}"]`);
+    const el = f && document.querySelector(`.follow-row-wrap[data-follow="${f.id}"], .follow-card[data-follow="${f.id}"]`);
     if (!el) return;
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     el.classList.add('is-flash');
@@ -5493,8 +5577,8 @@ window.logout = async function logout() {
 // docs) lives at / so the address bar stays clean. Old links (/closed, /settings/profile…)
 // still open the right place, then the address is tidied to / or /settings.
 // ============================================================================
-const TERMINAL_ROUTES = ['positions', 'closed', 'signals', 'wallets', 'history'];
-const SETTINGS_ROUTES = ['copytrades', 'trading', 'data', 'profile', 'security', 'notifications'];
+const TERMINAL_ROUTES = ['positions', 'closed', 'signals', 'wallets', 'history', 'follows'];
+const SETTINGS_ROUTES = ['trading', 'data', 'profile', 'security', 'notifications', 'integrations'];
 let routeApplying = false;
 let nextAfterLogin = null;
 let openedAtRoot = location.pathname === '/' || location.pathname === '';
@@ -5550,8 +5634,7 @@ function applyRoute(pathname, push = false) {
       goTerminalTab('config');
       openSettingsSection(SETTINGS_ROUTES.includes(b) ? b : currentCfgSection);
     } else if (a === 'copytrades' || a === 'copytrade' || a === 'follows') {
-      goTerminalTab('config');
-      openSettingsSection('copytrades');
+      goTerminalTab('follows');
     } else if (TERMINAL_ROUTES.includes(a)) goTerminalTab(a); // old link
     else if (a === 'docs') switchMainView('docs'); // old link
     else if (a === 'dax') openDax();
