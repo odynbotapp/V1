@@ -149,14 +149,10 @@ const heliusFastRpc = heliusApiKey ? `https://mainnet.helius-rpc.com/?api-key=${
 const heliusStakedRpc = heliusApiKey ? `https://staked.helius-rpc.com?api-key=${heliusApiKey}` : null;
 const heliusSenderRpc = 'https://sender.helius-rpc.com/fast';
 const DEFAULT_JITO_ENDPOINTS = [
-  'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
-  'https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions',
-  'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
   'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/transactions',
-  'https://slc.mainnet.block-engine.jito.wtf/api/v1/transactions',
-  'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/transactions',
+  'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
   'https://london.mainnet.block-engine.jito.wtf/api/v1/transactions',
-  'https://dublin.mainnet.block-engine.jito.wtf/api/v1/transactions',
+  'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
 ];
 const jitoEndpoints = [
   ...(process.env.ODEX_JITO_RPC_URL ? [String(process.env.ODEX_JITO_RPC_URL).trim()] : []),

@@ -648,7 +648,7 @@ test('PD24 Part 1 Infra: multi-relay variant fan-out (Jito + Nozomi + Astralane)
   const origFetch = trader.fetch;
   trader.fetch = async (url, opts) => {
     const s = String(url);
-    if (opts?.method === 'OPTIONS') {
+    if (opts?.method === 'OPTIONS' || opts?.method === 'GET') {
       if (s.includes('astralane')) fakeNow += 2;
       else if (s.includes('nozomi')) fakeNow += 5;
       else if (s.includes('jito.wtf')) fakeNow += 40;

@@ -693,10 +693,13 @@ export class RealTrader {
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 3000);
         t.unref?.();
+        const kind = PD.detectRelayKind(origin);
+        const warmUrl = kind === 'nozomi' ? `${origin}/ping` : kind === 'astralane' ? `${origin}/gethealth` : origin;
+        const warmMethod = kind === 'nozomi' || kind === 'astralane' ? 'GET' : 'OPTIONS';
         const t0 = this.now();
         try {
-          await this.fetch(origin, {
-            method: 'OPTIONS',
+          await this.fetch(warmUrl, {
+            method: warmMethod,
             keepalive: true,
             signal: ctrl.signal,
           });
@@ -1198,18 +1201,22 @@ export class RealTrader {
       fastSendStart = this.now();
       this.blastSignedTransaction(signed.base64, { bundleOnly, variantByRelay });
       fastSendP = this.rpc('sendTransaction', [signed.base64, { encoding: 'base64', skipPreflight: true, maxRetries: 3 }]).catch(() => null);
-      // Start signature confirmation micro-polling immediately in parallel with simulation & send
+      // Start signature confirmation micro-polling immediately in parallel with send
       fastConfirmP = variantSigs.length
         ? this.waitForAnySignature([fastSig, ...variantSigs], 25_000)
         : this.waitForSignature(fastSig, 25_000).then((st) => ({ status: st, signature: fastSig }));
     }
-    const simP = this.rpc('simulateTransaction', [signed.base64, { encoding: 'base64', commitment: 'processed', sigVerify: true, replaceRecentBlockhash: false, accounts: { encoding: 'base64', addresses: [this.address, d.userAta] } }]);
-    // ----- simulate and check the balance changes -----
-    let sim;
-    try {
-      sim = await simP;
-    } catch (err) {
-      if (!fastSent) return { fallback: true, error: `simulation: ${err.message}` };
+    // Skip redundant simulateTransaction RPC when fastSent is already true (the tx is already blasted
+    // with on-chain atomic min_tokens_out / min_sol_output protection; saving 1 RPC call avoids 429s
+    // and lets fill confirmation proceed without waiting on simulation).
+    let sim = null;
+    if (!fastSent) {
+      const simP = this.rpc('simulateTransaction', [signed.base64, { encoding: 'base64', commitment: 'processed', sigVerify: true, replaceRecentBlockhash: false, accounts: { encoding: 'base64', addresses: [this.address, d.userAta] } }]);
+      try {
+        sim = await simP;
+      } catch (err) {
+        return { fallback: true, error: `simulation: ${err.message}` };
+      }
     }
     const simErr = sim?.value?.err;
     if (simErr && !fastSent) {
@@ -1483,6 +1490,12 @@ export class RealTrader {
       const relayKind = PD.detectRelayKind(rawUrl);
       if (bundleOnly && relayKind === 'jito' && !/[?&]bundleOnly=/i.test(String(rawUrl))) {
         url = `${rawUrl}${String(rawUrl).includes('?') ? '&' : '?'}bundleOnly=true`;
+      }
+      // Dedicated tip-requiring SWQoS relays (Nozomi, Astralane, NextBlock, BlockRazor, Stellium, LandX, Speedy)
+      // reject any tx that doesn't tip their own tip account: skip them when no matching variant was built
+      // (e.g. top-up buys where ATA already exists or sells without a relay-specific tip).
+      if (relayKind !== 'swqos' && relayKind !== 'jito' && (!variantByRelay || !variantByRelay.has(relayKind))) {
+        continue;
       }
       const txB64 = variantByRelay?.get(relayKind) || signedBase64;
       const payload =
