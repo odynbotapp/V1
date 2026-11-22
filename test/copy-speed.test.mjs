@@ -1102,15 +1102,16 @@ test('S22 Nov 11 4-edit calibration: smart maxChase (30% <=$12k MC, 26.5% >$12k 
   });
 
   const f = e.follows[0];
-  assert.equal(f.maxChasePct, 65);
+  assert.equal(f.maxChasePct, 35);
   assert.equal(f.matureMaxChasePct, 26.5);
   assert.equal(f.freshMcMaxUsd, 15000);
+  assert.equal(f.slPct, null);
   assert.equal(f.exitRules.moonbagTrail.armsAtPct, 22);
   assert.equal(f.exitRules.floor.graceSec, 4);
   assert.equal(f.filtersOverride.maxMarketCapUsd, 100000);
 
-  // Fresh micro-cap (<= $15k MC) allows 65% chase so 3 SOL curve jumps don't 6042, while > $15k MC caps at 26.5%
-  assert.equal(e.maxChaseFor(f, { marketCapUsd: 9100 }), 65);
+  // Fresh micro-cap (<= $15k MC) allows 35% chase, while > $15k MC caps at 26.5%
+  assert.equal(e.maxChaseFor(f, { marketCapUsd: 9100 }), 35);
   assert.equal(e.maxChaseFor(f, { marketCapUsd: 16900 }), 26.5);
 
   // Edit #4: updog ($780.3k MC > $100k limit) is skipped by market cap filter

@@ -2142,7 +2142,7 @@ export class RealTrader {
       } else {
         if (tDelta < 0n) inputRaw = -tDelta;
         if (quoteMint === WSOL_MINT && solDelta !== null) {
-          if (outputRaw === null || (!exactExec && solDelta > 0n)) outputRaw = solDelta + BigInt(tx.meta.fee || 5000);
+          if (outputRaw === null || ((!exactExec || outputRaw - solDelta > 5_000_000n) && solDelta > 0n)) outputRaw = solDelta + BigInt(tx.meta.fee || 5000);
           networkLamports = Number(outputRaw - solDelta);
         } else networkLamports = Number(tx.meta.fee || 5000);
       }

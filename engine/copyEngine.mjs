@@ -965,7 +965,7 @@ export class CopyTradingEngine {
       entryCeilingUsd = Number(token.traderFillPriceUsd) * (1 + maxChase / 100);
       // Jupiter's slippage is a minimum token amount: s% fewer tokens = paying up to 1/(1−s) more.
       // Largest slippage that keeps the fill at or under the ceiling: 1 − quote/ceiling.
-      const roomFor = (q) => (1 - Number(q.quotedPriceUsd) / entryCeilingUsd) * 100;
+      const roomFor = (q) => (1 - Math.max(Number(q.quotedPriceUsd) || 0, Number(token.traderFillPriceUsd) || 0) / entryCeilingUsd) * 100;
       const tooHigh = (gap) => {
         if (!dryRun) this.markCopiedCycle(follow.id, token.address, 'missed');
         return this.recordSkip({ dryRun, follow, wallet, signal, reason: `price moved too far before we could copy — the fill could land more than your ${maxChase}% max chase above the trader's price`, chaseGapPct: Number(gap.toFixed(2)) });

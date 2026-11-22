@@ -105,10 +105,18 @@ export function restoreEngine(engine, data) {
         f.decuV10Migrated = true;
       }
       if ((f.id === 'fol-03782071' || f.id === 'fol-061e3abc' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9') && !f.decuV11Migrated) {
-        f.maxChasePct = 65;
+        f.maxChasePct = 35;
         f.matureMaxChasePct = 26.5;
         f.freshMcMaxUsd = 15000;
         f.decuV11Migrated = true;
+      }
+      if ((f.id === 'fol-03782071' || f.id === 'fol-061e3abc' || f.traderWallet === '4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9') && !f.decuV12Migrated) {
+        f.maxChasePct = 35;
+        f.matureMaxChasePct = 26.5;
+        f.freshMcMaxUsd = 15000;
+        f.slPct = null;
+        f.tpPct = null;
+        f.decuV12Migrated = true;
       }
     }
   }
